@@ -35,6 +35,10 @@ def _publish_cfg() -> dict:
         return {}
 
 _CFG = _publish_cfg()
+# Empirical, not documented by IG: 10 minutes silently failed, the batch's
+# other slots (hours to days out) all worked. Raise it if a 30-minute lead
+# ever fails too.
+MIN_LEAD_MIN = 30
 CLIPS_DIR = Path(_CFG.get("clips_dir", "~/Downloads")).expanduser()
 COLLABORATORS = _CFG.get("ig_collaborators", [])
 
@@ -58,6 +62,20 @@ def main() -> int:
     if not video.exists():
         print(f"error: {video} not found", file=sys.stderr)
         return 1
+
+    # IG needs real lead time. A submit 10 minutes ahead of its slot took the
+    # whole upload, said Schedule, and scheduled nothing (2026-09-10). The
+    # upload costs minutes, so refuse before spending them.
+    if args.submit:
+        import datetime as _dt
+        slot = _dt.datetime.fromisoformat(f"{post['date']}T{plan['time_local']}")
+        lead = (slot - _dt.datetime.now()).total_seconds() / 60
+        if lead < MIN_LEAD_MIN:
+            print(json.dumps({"status": "too_soon", "clip": args.clip,
+                              "slot": f"{post['date']} {plan['time_local']}",
+                              "lead_minutes": round(lead),
+                              "min_lead_minutes": MIN_LEAD_MIN}, ensure_ascii=False))
+            return 5
 
     from playwright.sync_api import sync_playwright
 
@@ -417,6 +435,18 @@ def main() -> int:
             }""", target.day)
         page.screenshot(path=args.shot.replace(".png", "-calendar.png"))
         ctx.close()
+        # No tile in the target day's column means nothing was scheduled, so say
+        # so instead of reporting success. 2026-09-10: a submit 10 minutes ahead
+        # of its slot returned calendar_tiles={0,0} and posted NOTHING, and the
+        # run was logged as submitted - the caller has to be able to trust this.
+        if not tiles.get("day_column"):
+            print(json.dumps({"status": "not_scheduled", "clip": args.clip,
+                              "date": post["date"], "calendar_tiles": tiles,
+                              "hint": "no tile in the target day's column - "
+                                      "re-run against a slot further out",
+                              "screenshot": args.shot.replace(".png", "-calendar.png")},
+                             ensure_ascii=False))
+            return 4
         print(json.dumps({"status": "submitted", "clip": args.clip,
                           "date": post["date"], "collaborators": collab_added,
                           "cover_set": cover_set,
