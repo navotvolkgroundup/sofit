@@ -78,3 +78,21 @@ def test_index_guard_rejects_non_increasing():
     ch = [Chapter(0.0, "א"), Chapter(30.0, "ב"), Chapter(90.0, "ג")]
     starts = [c.start for c in ch]
     assert starts == sorted(starts)
+
+
+def test_rtl_caption_pins_direction():
+    from sofit.format import RLM, rtl_caption
+
+    # Latin hashtags get closed so they keep order and their "#" reads right
+    tags = "#וויקליסינק #Instinct #AI #מוצר"
+    assert rtl_caption(tags) == f"#וויקליסינק #Instinct{RLM} #AI{RLM} #מוצר"
+
+    # a paragraph opening on a Latin brand name is pinned RTL at the head
+    assert rtl_caption("Decart ספרה לעיתונאים").startswith(RLM)
+    # ...but one that already starts Hebrew is left alone
+    assert rtl_caption("תור על Decart") == "תור על Decart"
+    # pure-Latin text is not ours to reorder
+    assert rtl_caption("Decart raised a round") == "Decart raised a round"
+    # blank lines survive, and the fix is idempotent
+    once = rtl_caption(f"Decart ספרה\n\n{tags}")
+    assert "\n\n" in once and rtl_caption(once) == once

@@ -11,6 +11,7 @@ it silently fail to detect chapters.
 from __future__ import annotations
 
 import json
+import re
 
 from .generate import Chapter, Quote
 
@@ -79,3 +80,36 @@ def render_quotes_md(quotes: list[Quote]) -> str:
     return "\n".join(
         f"{LRM}{fmt_timestamp(q.start)}–{fmt_timestamp(q.end)} — {q.text}" for q in quotes
     )
+
+
+RLM = "‏"  # Right-to-Left Mark
+_HEBREW = re.compile(r"[֐-׿]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def rtl_caption(text: str) -> str:
+    """Pin a Hebrew social caption to RTL so the platforms don't reorder it.
+
+    TikTok/IG/YouTube render each paragraph with dir=auto, which takes its
+    direction from the FIRST strong character. Two things break:
+
+    - A paragraph opening on a Latin brand name ("Decart ספרה...") resolves the
+      whole paragraph to LTR and scrambles the Hebrew segment order.
+    - A Latin hashtag among Hebrew ones ("#וויקליסינק #Instinct #AI") comes out
+      in reversed order with its "#" reading on the far side of the word.
+
+    Both are fixed by making the direction explicit: an RLM at the head of any
+    paragraph that starts Latin, and one closing each Latin-script hashtag.
+    """
+    out = []
+    for para in text.replace(RLM, "").split("\n"):  # idempotent: re-mark from clean
+        if not para.strip():
+            out.append(para)
+            continue
+        if _HEBREW.search(para):
+            para = re.sub(r"(#[A-Za-z][^\s#]*)", r"\1" + RLM, para)
+            strong = _HEBREW.search(para), _LATIN.search(para)
+            if strong[1] and (not strong[0] or strong[1].start() < strong[0].start()):
+                para = RLM + para
+        out.append(para)
+    return "\n".join(out)

@@ -203,9 +203,19 @@ def _call_claude_cli(system: str, user: str, model: str) -> str:
     cmd = ["claude", "-p", "--append-system-prompt", system, "--output-format", "text"]
     if os.environ.get("SOFIT_TITLER_MODEL"):
         cmd += ["--model", model]
+    # Running sofit from INSIDE Claude Code leaks that session's environment to
+    # the nested CLI - ANTHROPIC_BASE_URL points at an internal proxy and the
+    # CLAUDE_CODE_* vars describe the parent session - and the child then dies
+    # with "OAuth session expired and could not be refreshed" even though the
+    # keychain credentials are fine (2026-09-10: killed a whole kit+pool run and
+    # looked exactly like a logged-out user). Hand the child a clean slate.
+    env = {k: v for k, v in os.environ.items()
+           if k != "ANTHROPIC_BASE_URL"
+           and not k.startswith(("CLAUDE_CODE_", "CLAUDE_"))
+           and k not in ("CLAUDECODE", "AI_AGENT")}
     try:
         proc = subprocess.run(
-            cmd,
+            cmd, env=env,
             input=user, capture_output=True, text=True, timeout=CLI_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
