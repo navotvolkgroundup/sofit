@@ -81,18 +81,21 @@ def test_index_guard_rejects_non_increasing():
 
 
 def test_rtl_caption_pins_direction():
-    from sofit.format import RLM, rtl_caption
+    from sofit.format import PDF, RLE, rtl_caption
 
-    # Latin hashtags get closed so they keep order and their "#" reads right
-    tags = "#וויקליסינק #Instinct #AI #מוצר"
-    assert rtl_caption(tags) == f"#וויקליסינק #Instinct{RLM} #AI{RLM} #מוצר"
+    # a Hebrew body paragraph gets an RTL embedding so an LTR container can't
+    # transpose its segments around the Latin brand name
+    body = "אשתמש ב-Instinct בעוד כמה חודשים."
+    assert rtl_caption(body) == RLE + body + PDF
 
-    # a paragraph opening on a Latin brand name is pinned RTL at the head
-    assert rtl_caption("Decart ספרה לעיתונאים").startswith(RLM)
-    # ...but one that already starts Hebrew is left alone
-    assert rtl_caption("תור על Decart") == "תור על Decart"
-    # pure-Latin text is not ours to reorder
+    # hashtag lines are left untouched - the platforms split them into one
+    # element per tag, and a control char next to "#" can land inside the tag
+    tags = "#וויקליסינק #Instinct #AI"
+    assert rtl_caption(tags) == tags
+
+    # nothing to do for text with no Hebrew, and blank lines survive
     assert rtl_caption("Decart raised a round") == "Decart raised a round"
-    # blank lines survive, and the fix is idempotent
-    once = rtl_caption(f"Decart ספרה\n\n{tags}")
-    assert "\n\n" in once and rtl_caption(once) == once
+    once = rtl_caption(f"{body}\n\n{tags}")
+    assert "\n\n" in once
+    # idempotent: a second pass re-marks from clean rather than nesting
+    assert rtl_caption(once) == once

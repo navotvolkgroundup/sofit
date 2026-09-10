@@ -82,34 +82,38 @@ def render_quotes_md(quotes: list[Quote]) -> str:
     )
 
 
-RLM = "‏"  # Right-to-Left Mark
+RLE = "‫"  # Right-to-Left Embedding
+PDF = "‬"  # Pop Directional Formatting
 _HEBREW = re.compile(r"[֐-׿]")
-_LATIN = re.compile(r"[A-Za-z]")
 
 
 def rtl_caption(text: str) -> str:
-    """Pin a Hebrew social caption to RTL so the platforms don't reorder it.
+    """Force RTL paragraph order on a Hebrew social caption.
 
-    TikTok/IG/YouTube render each paragraph with dir=auto, which takes its
-    direction from the FIRST strong character. Two things break:
+    Measured 2026-09-10 against live TikTok and Instagram posts: neither
+    renders captions with dir=auto. TikTok's caption node computes
+    `direction: ltr; unicode-bidi: isolate`, and Instagram's dir=auto sits on a
+    wrapper that opens with the Latin account handle, so it always resolves
+    LTR. In an LTR paragraph every Hebrew run is placed left-to-right in
+    logical order, so any sentence carrying a Latin brand name comes out with
+    its segments transposed — "אשתמש ב-Instinct בעוד כמה חודשים" reads as
+    "בעוד כמה חודשים ב-Instinct אשתמש", and trailing punctuation jumps to the
+    wrong edge.
 
-    - A paragraph opening on a Latin brand name ("Decart ספרה...") resolves the
-      whole paragraph to LTR and scrambles the Hebrew segment order.
-    - A Latin hashtag among Hebrew ones ("#וויקליסינק #Instinct #AI") comes out
-      in reversed order with its "#" reading on the far side of the word.
+    A bare RLM cannot fix that: the container's direction is explicit, not
+    auto, so the paragraph needs an embedding to override it. RLE...PDF around
+    each paragraph does, verified in the same container the platforms use.
 
-    Both are fixed by making the direction explicit: an RLM at the head of any
-    paragraph that starts Latin, and one closing each Latin-script hashtag.
+    Hashtag-only paragraphs are left ALONE. Both platforms re-parse hashtags
+    into one element per tag, which isolates them anyway, and an invisible
+    control character next to a "#" risks ending up inside the tag itself.
+    Order Hebrew tags before Latin ones instead.
     """
     out = []
-    for para in text.replace(RLM, "").split("\n"):  # idempotent: re-mark from clean
-        if not para.strip():
+    for para in text.replace(RLE, "").replace(PDF, "").split("\n"):  # re-mark from clean
+        stripped = para.strip()
+        if not stripped or stripped.startswith("#") or not _HEBREW.search(para):
             out.append(para)
-            continue
-        if _HEBREW.search(para):
-            para = re.sub(r"(#[A-Za-z][^\s#]*)", r"\1" + RLM, para)
-            strong = _HEBREW.search(para), _LATIN.search(para)
-            if strong[1] and (not strong[0] or strong[1].start() < strong[0].start()):
-                para = RLM + para
-        out.append(para)
+        else:
+            out.append(RLE + para + PDF)
     return "\n".join(out)
