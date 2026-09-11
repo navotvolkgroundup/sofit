@@ -721,11 +721,19 @@ def _merge_continuations(words: list[dict]) -> list[dict]:
     and a one-letter Hebrew prefix can wrap to the previous line entirely -
     "ה-AI והכלי-AI" came out as "AI- והכלי AI-" (2026-09-03). A token that
     starts with a hyphen or a decimal point is a continuation, never a word.
+
+    Same for a thousands comma and a geresh (2026-09-10): "80,000" arrives as
+    ["80", ",000"] and renders "80 ,000", and "דיליג'נס" / "נינג'ה" / "פיצ'ר"
+    arrive split at the apostrophe and render with a space before it.
     """
     out: list[dict] = []
     for w in words:
         txt = w["text"]
-        cont = (len(txt) > 1 and (txt[0] == "-" or (txt[0] == "." and txt[1].isdigit())))
+        cont = len(txt) > 1 and (
+            txt[0] == "-"
+            or (txt[0] in ".," and txt[1].isdigit())
+            or txt[0] in "'׳’"
+        )
         # a bare one-letter Hebrew prefix immediately followed by a hyphen token
         if out and cont:
             out[-1] = {"text": out[-1]["text"] + txt,

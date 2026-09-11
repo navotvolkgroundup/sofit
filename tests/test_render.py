@@ -728,3 +728,24 @@ def test_merge_continuations():
     merged = _merge_continuations([{"text": "ה", "start": 1.0, "end": 1.2},
                                    {"text": "-AI", "start": 1.2, "end": 1.9}])
     assert merged[0]["start"] == 1.0 and merged[0]["end"] == 1.9
+
+
+def test_merge_continuations_commas_and_geresh():
+    from sofit.render import _merge_continuations
+
+    def toks(*ws):
+        return [{"text": w, "start": i * 0.3, "end": i * 0.3 + 0.3}
+                for i, w in enumerate(ws)]
+
+    def texts(ws):
+        return [w["text"] for w in _merge_continuations(ws)]
+
+    # a thousands comma is a continuation, not a word: "80 ,000" was reaching
+    # the burn-in with a space before the comma
+    assert texts(toks("מ", "-80", ",000")) == ["מ-80,000"]
+    assert texts(toks("2", ",000")) == ["2,000"]
+    # so is a geresh - "דיליג'נס" arrives split at the apostrophe
+    assert texts(toks("דיליג", "'נס")) == ["דיליג'נס"]
+    assert texts(toks("נינג", "\u05f3\u05d4")) == ["נינג\u05f3\u05d4"]
+    # a comma that isn't a thousands separator stays its own token
+    assert texts(toks("שלום", ", עולם")) == ["שלום", ", עולם"]
