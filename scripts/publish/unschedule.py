@@ -115,11 +115,64 @@ TAG_ROW_JS = """([needle, minButtons, needImg]) => {
 }"""
 
 
+# A single row's text is short; a whole table's is thousands of characters. The
+# 2026-09-10 misfire tagged a container spanning EVERY row, so `.last` button was
+# a different row's menu. Bounding the tagged element's text rules that out.
+MAX_ROW_TEXT = 600
+
+
 def tag_row(page, want: str, min_buttons: int, need_img: bool = False):
     res = page.evaluate(TAG_ROW_JS, [want, min_buttons, need_img])
     if not res.get("tagged"):
         raise RuntimeError(f"row not tagged: {res.get('why')}")
-    return page.locator("[data-sofit-row]").first
+    row = page.locator("[data-sofit-row]").first
+    text = row.inner_text(timeout=8_000)
+    if want not in text:
+        raise RuntimeError("tagged element does not contain the needle")
+    if len(text) > MAX_ROW_TEXT:
+        raise RuntimeError(
+            f"tagged element holds {len(text)} chars - that is a container, "
+            f"not one row; refusing to click inside it")
+    return row
+
+
+# Whole-listing size, so collateral damage is detectable. Yesterday's misfire
+# left the target in place (which the needle check caught) while destroying a
+# post 20 rows away (which nothing caught). Exactly one item must disappear.
+INVENTORY_JS = {
+    # No usable listing-size signal on TikTok. The "Posts N" header counts UP on
+    # a new post but does NOT count down after a confirmed deletion (measured
+    # 2026-09-11), and every other count is taken after the search filter has
+    # already narrowed the list, so it measures the match, not the inventory.
+    # Collateral has to be checked one level up - re-list the episode's other
+    # posts after a delete - so don't pretend to a guarantee here.
+    "tiktok": """() => null""",
+    "youtube": """() => document.querySelectorAll('ytcp-video-row').length || null""",
+    "instagram": """() => [...document.querySelectorAll('img')]
+        .filter(i => i.alt === 'Scheduled post thumbnail' && i.offsetParent !== null)
+        .length""",
+}
+
+
+def inventory(page, platform: str):
+    try:
+        return page.evaluate(INVENTORY_JS[platform])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def menu_items(page) -> list[str]:
+    """Text of whatever menu is currently open. Menus render in a portal outside
+    the row, so they cannot be scoped to it - assert the SHAPE instead."""
+    return page.evaluate("""() => {
+        const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE']);
+        return [...document.querySelectorAll('*')]
+          .filter(e => e.children.length === 0 && !SKIP.has(e.tagName) &&
+                       e.offsetParent !== null &&
+                       /^(Delete|Download|Delete forever|Edit|Duplicate)$/i
+                         .test((e.textContent || '').trim()))
+          .map(e => (e.textContent || '').trim());
+    }""")
 
 
 def delete_tiktok(page, want: str) -> dict:
@@ -128,6 +181,11 @@ def delete_tiktok(page, want: str) -> dict:
     row.scroll_into_view_if_needed(timeout=8_000)
     row.locator("button, [role=button]").last.click(timeout=8_000)   # the "..."
     page.wait_for_timeout(1_500)
+    # the row menu is exactly Download + Delete; anything else means the click
+    # landed somewhere unexpected and clicking "Delete" now is a coin toss
+    items = menu_items(page)
+    if sorted(i.lower() for i in items) != ["delete", "download"]:
+        raise RuntimeError(f"unexpected row menu {items!r} - not clicking Delete")
     page.get_by_text("Delete", exact=True).first.click(timeout=8_000)
     page.wait_for_timeout(1_500)
     for name in ("Delete", "Confirm", "OK"):             # confirmation dialog
@@ -245,6 +303,7 @@ def main() -> int:
             ctx.close()
             return 7
 
+        before = inventory(page, args.platform)
         try:
             DELETERS[args.platform](page, want)
         except Exception as e:  # noqa: BLE001
@@ -257,11 +316,30 @@ def main() -> int:
         # verify from a fresh load: the in-page DOM lies after a mutation
         open_listing(page, args.platform, post)
         left = page.evaluate(COUNT_JS, want)
+        after = inventory(page, args.platform)
         page.screenshot(path=args.shot.replace(".png", "-after.png"), full_page=True)
         ctx.close()
-        print(json.dumps({**base, "status": "deleted" if left == 0 else "still_present",
-                          "matches_after": left}, ensure_ascii=False))
-        return 0 if left == 0 else 6
+        res = {**base, "matches_after": left, "inventory": [before, after]}
+
+        # BOTH halves must hold: the target is gone AND the listing shrank by
+        # exactly one. Target-gone alone cannot see collateral damage, and a
+        # count drop alone cannot tell which item went.
+        if left != 0:
+            print(json.dumps({**res, "status": "still_present"}, ensure_ascii=False))
+            return 6
+        if before is None or after is None:
+            print(json.dumps({**res, "status": "deleted_unverified",
+                              "why": "could not read the listing size; confirm by hand"},
+                             ensure_ascii=False))
+            return 8
+        if after != before - 1:
+            print(json.dumps({**res, "status": "collateral_suspected",
+                              "why": f"listing went {before} -> {after}, expected "
+                                     f"{before - 1}; something else changed too"},
+                             ensure_ascii=False))
+            return 9
+        print(json.dumps({**res, "status": "deleted"}, ensure_ascii=False))
+        return 0
 
 
 if __name__ == "__main__":
