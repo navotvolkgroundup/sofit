@@ -294,12 +294,12 @@ def delete_youtube(page, want: str) -> dict:
     # The confirm dialog NAMES the video it is about to destroy. That is the
     # best guard available anywhere in this file - read it back before saying
     # yes, so a mis-clicked row cannot get past this point.
-    page.get_by_text(re.compile("Permanently delete this video", re.I)).first.wait_for(
+    page.get_by_text(re.compile(r"Permanently delete this (draft )?video", re.I)).first.wait_for(
         timeout=10_000)
     shown = page.evaluate("""() => {
         const t = [...document.querySelectorAll('*')].find(e =>
             e.offsetParent !== null &&
-            /Permanently delete this video/i.test(e.innerText || '') &&
+            /Permanently delete this (draft )?video/i.test(e.innerText || '') &&
             (e.innerText || '').length < 900);
         return t ? t.innerText : '';
     }""")
@@ -312,7 +312,7 @@ def delete_youtube(page, want: str) -> dict:
     page.get_by_text(re.compile("I understand that deleting", re.I)).first.click(
         timeout=8_000)
     page.wait_for_timeout(800)
-    page.get_by_role("button", name=re.compile("Delete forever", re.I)).first.click(
+    page.get_by_role("button", name=re.compile(r"Delete (forever|draft video)", re.I)).first.click(
         timeout=8_000)
     page.wait_for_timeout(6_000)
     return {}
