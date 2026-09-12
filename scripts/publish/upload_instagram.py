@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -355,13 +356,49 @@ def main() -> int:
                      return `${d?d.textContent.trim():'?'} ${t||'?:?'}`; }""")
         except Exception as e:  # noqa: BLE001
             print(f"warn: schedule step failed ({e})", file=sys.stderr)
+        # Cross-post to the Facebook page, if the account is linked and the
+        # config asks for it. The control lives under a collapsed "Share to"
+        # section. Read the toggle back rather than trusting the click - a
+        # silent no-op here is exactly how the collaborator field lost Tor on
+        # seven of eight posts.
+        fb_state = None
+        if _CFG.get("share_to_facebook"):
+            try:
+                # click the ROW, not the label: the label is a text node inside
+                # an expander and clicking it does not toggle the section
+                sec = page.locator("div[role=button]").filter(
+                    has_text=re.compile(r"^Share to")).first
+                if not sec.count():
+                    sec = page.get_by_text("Share to", exact=True).first
+                sec.click(timeout=6_000)
+                page.wait_for_timeout(2_000)
+                fb_section = page.evaluate("""() => {
+                    const h = [...document.querySelectorAll('*')].find(e =>
+                        e.offsetParent !== null &&
+                        (e.innerText || '').trim().startsWith('Share to') &&
+                        (e.innerText || '').length < 400);
+                    return h ? h.innerText.replace(/\\s+/g, ' ').slice(0, 300) : null;
+                }""")
+                print(f"info: Share to section reads {fb_section!r}", file=sys.stderr)
+                tog = page.locator(
+                    "div[role=button]:has-text('Facebook'), label:has-text('Facebook')"
+                ).locator("input[type=checkbox], [role=switch]").first
+                if tog.count():
+                    if tog.get_attribute("aria-checked") != "true":
+                        tog.click(timeout=6_000)
+                        page.wait_for_timeout(1_200)
+                    fb_state = tog.get_attribute("aria-checked")
+                else:
+                    fb_state = "control_not_found"
+            except Exception as e:  # noqa: BLE001
+                fb_state = f"failed: {str(e)[:60]}"
         page.screenshot(path=args.shot, full_page=False)
 
         if args.dry:
             ctx.close()
             print(json.dumps({"status": "dry_ok", "screenshot": args.shot,
                               "clip": args.clip, "collaborators": collab_added,
-                              "cover_set": cover_set,
+                              "cover_set": cover_set, "facebook": fb_state,
                               "schedule_fields": sched_val},
                              ensure_ascii=False))
             return 0
