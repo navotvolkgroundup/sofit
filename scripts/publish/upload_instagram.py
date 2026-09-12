@@ -366,12 +366,27 @@ def main() -> int:
             try:
                 # click the ROW, not the label: the label is a text node inside
                 # an expander and clicking it does not toggle the section
-                sec = page.locator("div[role=button]").filter(
-                    has_text=re.compile(r"^Share to")).first
-                if not sec.count():
-                    sec = page.get_by_text("Share to", exact=True).first
-                sec.click(timeout=6_000)
-                page.wait_for_timeout(2_000)
+                # Click the expander ROW (its chevron sits at the far right);
+                # clicking the label text alone leaves the section collapsed.
+                opened = page.evaluate("""() => {
+                    const label = [...document.querySelectorAll('*')].find(e =>
+                        e.offsetParent !== null &&
+                        (e.innerText || '').trim() === 'Share to');
+                    if (!label) return false;
+                    for (let n = label; n; n = n.parentElement) {
+                        const r = n.getBoundingClientRect();
+                        if (r.width > 250 && r.height > 30 && r.height < 90) {
+                            n.setAttribute('data-sofit-share', '1');
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if opened:
+                    page.locator("[data-sofit-share]").first.click(timeout=6_000)
+                else:
+                    page.get_by_text("Share to", exact=True).first.click(timeout=6_000)
+                page.wait_for_timeout(2_500)
                 fb_section = page.evaluate("""() => {
                     const h = [...document.querySelectorAll('*')].find(e =>
                         e.offsetParent !== null &&
