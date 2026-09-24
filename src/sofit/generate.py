@@ -467,6 +467,62 @@ def make_shownotes(segments: list[Segment], titler: str = "api") -> dict:
     return call_claude_json(system, user, validate, titler=titler)
 
 
+def make_youtube_tags(segments: list[Segment], shownotes: dict | None = None,
+                      titler: str = "api") -> dict:
+    """YouTube description hashtags + the comma-separated tags field.
+
+    Navot, 2026-09-24. Two different surfaces with different rules: the
+    DESCRIPTION takes a handful of hashtags (YouTube only renders the first
+    three above the title, so order matters), while the TAGS field is a
+    search-recall tool - it is never shown to a viewer, so it should carry the
+    spellings people actually type, not the correct ones.
+
+    That is why misspellings and Latin/Hebrew variants of every name belong in
+    tags and never in hashtags: a hashtag is public and a typo there looks
+    illiterate, while a typo in tags is the whole point.
+    """
+    if not segments:
+        return {"hashtags": [], "tags": []}
+    notes = ""
+    if shownotes:
+        notes = (shownotes.get("summary") or "") + "\n" + "\n".join(shownotes.get("bullets") or [])
+    system = (
+        "You prepare YouTube metadata for a Hebrew tech podcast (Weekly Sync / "
+        "וויקלי סינק, hosts נבות וולק and תור צוק). Return ONLY JSON: "
+        '{"hashtags": [str, ...], "tags": [str, ...]}.\n'
+        "hashtags: 7-8 items for the DESCRIPTION. Each starts with '#'. Join a "
+        "multi-word hashtag with underscores (#בינה_מלאכותית). Hebrew unless the "
+        "term is normally Latin (#AI, #startup). Put the most specific first - "
+        "YouTube shows only the first three above the title. No spaces, no typos.\n"
+        "tags: 25-40 items for the video's TAGS field, plain text, no '#'. This "
+        "field is invisible to viewers and exists for search recall, so include "
+        "for EVERY person, company, product and show named in the episode: the "
+        "Hebrew spelling, the Latin spelling, and the misspellings a viewer "
+        "would plausibly TYPE (missing yud, swapped vav/vav-vav, phonetic "
+        "guesses). Also include the episode's topics as search phrases. Never "
+        "invent a name that is not in the material."
+    )
+    user = (notes + "\n\n" + " ".join(s.text for s in segments))[:60000]
+
+    def validate(obj):
+        if not isinstance(obj, dict):
+            raise GenerationError("expected an object")
+        hs = [h if h.startswith("#") else "#" + h for h in (obj.get("hashtags") or [])]
+        hs = [h.replace(" ", "_") for h in hs]
+        tags = [t.strip() for t in (obj.get("tags") or []) if t and t.strip()]
+        if not hs or not tags:
+            raise GenerationError("expected non-empty hashtags and tags")
+        # YouTube rejects a tags field over 500 characters including commas.
+        kept, total = [], 0
+        for t_ in dict.fromkeys(tags):
+            if total + len(t_) + 2 > 500:
+                break
+            kept.append(t_); total += len(t_) + 2
+        return {"hashtags": list(dict.fromkeys(hs))[:8], "tags": kept}
+
+    return call_claude_json(system, user, validate, titler=titler)
+
+
 def make_quotes(
     segments: list[Segment],
     titler: str = "api",

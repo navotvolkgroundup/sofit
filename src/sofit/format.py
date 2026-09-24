@@ -76,6 +76,23 @@ def render_shownotes_md(notes: dict) -> str:
     return "\n".join(lines).strip()
 
 
+def render_youtube_tags_md(meta: dict) -> str:
+    """Two blocks, both copy-paste ready: hashtags for the description,
+    tags as one comma-separated line for the video settings field."""
+    hs = meta.get("hashtags") or []
+    tags = meta.get("tags") or []
+    joined = ", ".join(tags)
+    return "\n".join([
+        "## hashtags (description)",
+        " ".join(hs),
+        "",
+        "## tags (video settings - paste as one line)",
+        joined,
+        "",
+        f"({len(tags)} tags, {len(joined)}/500 chars)",
+    ])
+
+
 def render_quotes_md(quotes: list[Quote]) -> str:
     return "\n".join(
         f"{LRM}{fmt_timestamp(q.start)}–{fmt_timestamp(q.end)} — {q.text}" for q in quotes

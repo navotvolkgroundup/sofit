@@ -61,6 +61,9 @@ def _parser() -> argparse.ArgumentParser:
                    "on --titler api; Claude Code's configured model on claude-cli)")
     p.add_argument("--shownotes", action="store_true", help="also generate Hebrew show notes")
     p.add_argument("--quotes", action="store_true", help="also extract pull-quotes")
+    p.add_argument("--yt-tags", action="store_true",
+                   help="also generate YouTube description hashtags + the tags field "
+                        "(tags deliberately carry name variants and likely misspellings)")
     p.add_argument("--quote-cards", metavar="DIR",
                    help="also render the pull-quotes as a branded IG carousel "
                         "(implies --quotes; slide 0 title from --episode-title)")
@@ -400,6 +403,14 @@ def main(argv: list[str] | None = None) -> int:
             _emit("shownotes", fmt.render_shownotes_md(generate.make_shownotes(segments, titler=args.titler)), args.out)
         except generate.GenerationError as e:
             print(f"warning: show notes failed: {e}", file=sys.stderr)
+            failed += 1
+    if args.yt_tags:
+        try:
+            _notes = generate.make_shownotes(segments, titler=args.titler)
+            _emit("yttags", fmt.render_youtube_tags_md(
+                generate.make_youtube_tags(segments, _notes, titler=args.titler)), args.out)
+        except generate.GenerationError as e:
+            print(f"warning: youtube tags failed: {e}", file=sys.stderr)
             failed += 1
     if args.quotes or args.quote_cards:
         try:
