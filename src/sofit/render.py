@@ -903,6 +903,35 @@ def _overlay_pillow_frames(video_path: Path, output_path: Path, width: int,
     return output_path
 
 
+def _hook_card_y(top_margin: int, block_h: int, face_band, height: int,
+                 caption_top: int) -> int:
+    """Where the flash hook card starts, so its lines don't land on the face.
+
+    It used to sit at top_margin unconditionally and grow DOWN into the
+    speaker ("why is it over Tsuk", 2026-09-23). The persistent card has
+    dodged faces since it shipped; this gives the flash card the same rule
+    instead of a new fixed percentage, which would only move the collision to
+    a different crop.
+
+    Order: leave it alone if it already clears the forehead; else lift it to
+    sit just above the face; else drop it below the chin if the caption block
+    leaves room; else give up and keep top_margin (a readable card over a
+    face beats a card pushed off-screen).
+    """
+    if not face_band:
+        return top_margin
+    m = int(height * 0.015)
+    face_top, face_bot = int(face_band[0] * height), int(face_band[1] * height)
+    if top_margin + block_h <= face_top:
+        return top_margin
+    above = face_top - m - block_h
+    if above >= top_margin:
+        return above
+    if face_bot + m + block_h <= caption_top:
+        return face_bot + m
+    return top_margin
+
+
 def _fit_hook_card(hook: str, height: int, max_w: int, font: str | None = None):
     """Wrap the hook card, shrinking the font until it fits 2 lines.
 
@@ -1042,6 +1071,12 @@ def _burn_captions_pillow(video_path: Path, entries: list[dict], output_path: Pa
     # The hook card must clear a top-corner logo. Raising the logo out of the
     # iPhone status bar pushed it INTO this band, so the card starts below it.
     top_margin = max(int(height * 0.16), hook_top_min)
+    # The flash card used to sit at top_margin unconditionally and its lines
+    # grew DOWN into the speaker's face ("why is it over Tsuk", 2026-09-23).
+    # The persistent card has dodged faces since it shipped; give the flash
+    # card the same treatment instead of guessing a new fixed percentage,
+    # which would only move the collision to a different crop.
+    hook_y = top_margin
     persistent_card = None
     card_pos = (0, 0)
     if hook and hook.strip() and hook_style == "persistent":
@@ -1114,6 +1149,8 @@ def _burn_captions_pillow(video_path: Path, entries: list[dict], output_path: Pa
             hook, height, max_w, font)
         hook_outline = max(3, hook_size // 7)
         hook_line_h = int(hook_size * 1.3)
+        hook_y = _hook_card_y(top_margin, hook_line_h * len(hook_lines), face_band,
+                              height, height - bottom_margin - 3 * line_h)
 
     def hook_w(txt: str) -> float:
         return measure.textlength(txt, font=hook_font)
@@ -1269,7 +1306,7 @@ def _burn_captions_pillow(video_path: Path, entries: list[dict], output_path: Pa
             if img is None:
                 img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                 d = ImageDraw.Draw(img)
-            y = top_margin
+            y = hook_y
             for line in hook_lines:
                 order = _bidi_word_order(line)  # visual left-to-right (base RTL)
                 lw = sum(hook_w(w["text"]) for w in order) + space_w_hook * (len(order) - 1)

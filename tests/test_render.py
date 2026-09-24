@@ -768,3 +768,24 @@ def test_output_fps_sources_and_bounds(tmp_path, monkeypatch):
     assert _output_fps() is None
     monkeypatch.setenv("SOFIT_FPS", "500")             # out of range
     assert _output_fps() is None
+
+
+def test_flash_hook_card_clears_a_tracked_face():
+    """Regression: the flash card grew DOWN into the speaker's face
+    ("why is it over Tsuk", 2026-09-23)."""
+    from sofit.render import _hook_card_y
+    H = 1920
+    cap_top = 1500
+
+    # no face tracked -> unchanged
+    assert _hook_card_y(300, 200, None, H, cap_top) == 300
+    # already clears the forehead -> unchanged
+    assert _hook_card_y(300, 100, (0.30, 0.60), H, cap_top) == 300
+    # would overlap, room above -> lifted so it ENDS above the face
+    y = _hook_card_y(100, 200, (0.30, 0.60), H, cap_top)
+    assert y + 200 <= int(0.30 * H)
+    # no room above, room below the chin -> dropped under it
+    y = _hook_card_y(300, 400, (0.20, 0.55), H, cap_top)
+    assert y >= int(0.55 * H)
+    # nowhere to go -> keeps top_margin rather than going off-screen
+    assert _hook_card_y(300, 900, (0.20, 0.55), H, 1000) == 300
