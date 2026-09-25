@@ -20,6 +20,8 @@ Caption rendering has two paths:
 
 from __future__ import annotations
 
+from .footage_progress import measured
+
 import json
 import os
 import shutil
@@ -1808,12 +1810,62 @@ def _logo_geometry(logo: str, tw: int, th: int, logo_pos: str,
     return lw, pos, hook_top_min
 
 
+def _append_cutaways(cmd: list[str], filters: list[str], last: str, idx: int,
+                     cutaways: list[dict], tw: int, th: int, speed: float = 1.0) -> tuple[str, int]:
+    """Splice normalized local assets into either the recording or audiogram."""
+    for k, c in enumerate(cutaways):
+        t0, t1 = float(c["start"]), float(c["end"])
+        t0, t1 = t0 / speed, t1 / speed
+        d = t1 - t0
+        vid = c.get("video")
+        if vid and os.path.exists(vid):
+            # Animated cutaway shot: cover-crop, freeze-hold if the
+            # shot is shorter than the window, shift into place.
+            cmd += ["-i", str(vid)]
+            framing = (f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                       f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2" if c.get("fit") == "contain"
+                       else f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}")
+            if c.get("fit") == "blur":
+                # Preserve the complete sharp frame, with a cheap moving backdrop.
+                bw, bh = max(2, tw // 8 * 2), max(2, th // 8 * 2)
+                framing = (
+                    f"split=2[cwbg{k}][cwfg{k}];"
+                    f"[cwbg{k}]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+                    f"crop={bw}:{bh},gblur=sigma=16,eq=brightness=-0.16:saturation=0.7,"
+                    f"scale={tw}:{th}[cwblur{k}];"
+                    f"[cwfg{k}]scale={tw}:{th}:force_original_aspect_ratio=decrease[cwsharp{k}];"
+                    f"[cwblur{k}][cwsharp{k}]overlay=(W-w)/2:(H-h)/2"
+                )
+            filters.append(
+                f"[{idx}:v]{framing},setsar=1,fps=30,"
+                f"tpad=stop_mode=clone:stop_duration=15,"
+                f"trim=duration={d},setpts=PTS-STARTPTS+{t0}/TB[cw{k}]")
+        else:
+            frames = max(1, round(d * 30))
+            cmd += ["-framerate", "30", "-loop", "1", "-t", str(d),
+                    "-i", str(c["image"])]
+            z = (f"1+0.08*on/{frames}" if k % 2 == 0
+                 else f"1.08-0.08*on/{frames}")
+            filters.append(
+                f"[{idx}:v]zoompan=z='{z}':x='(iw-iw/zoom)/2'"
+                f":y='(ih-ih/zoom)/2':d=1:s={tw}x{th}:fps=30,"
+                f"trim=duration={d},setpts=PTS-STARTPTS+{t0}/TB[cw{k}]")
+        # Fractional beat boundaries need the last frame held until the enable
+        # window ends; passing through at EOF exposes the base for one frame.
+        filters.append(
+            f"[{last}][cw{k}]overlay=0:0:enable="
+            f"'between(t,{t0},{t1})':eof_action=repeat[ov{k}]")
+        last, idx = f"ov{k}", idx + 1
+    return last, idx
+
+
 def _audiogram_cmd(source_video: Path, padded_start: float, duration: float,
                    tw: int, th: int, bg_png: str, art_png: str | None,
                    logo: str | None, logo_pos: str, safe_area: str,
                    speed: float, af: str, temp_clip: Path,
                    card_fade_at: float | None = None,
-                   music: str | None = None) -> tuple[list[str], int]:
+                   music: str | None = None,
+                   cutaways: list[dict] | None = None) -> tuple[list[str], int]:
     """ffmpeg command for an audio-only source: blurred cover background with a
     slow push-in, optional rounded art card, and a subtle waveform strip (the
     captions burned by the later Pillow pass are the hero element — research
@@ -1853,6 +1905,7 @@ def _audiogram_cmd(source_video: Path, padded_start: float, duration: float,
               f":colors=white@0.75[wv]")
     fc.append(f"[{last}][wv]overlay=0:{round(th * 0.60)}:format=auto[wav]")
     last = "wav"
+    last, idx = _append_cutaways(cmd, fc, last, idx, _usable_cutaways(cutaways or []), tw, th)
     hook_top_min = 0
     if logo and os.path.exists(logo):
         lw, pos, hook_top_min = _logo_geometry(logo, tw, th, logo_pos, safe_area)
@@ -1899,6 +1952,7 @@ def _audiogram_cmd(source_video: Path, padded_start: float, duration: float,
 # ffmpeg runner + clip extraction
 # ---------------------------------------------------------------------------
 
+@measured("ffmpeg")
 def _run_ffmpeg(cmd: list[str]) -> None:
     """Run an ffmpeg command and raise with a useful error on failure."""
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
@@ -1913,6 +1967,38 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         ]
         error_msg = "\n".join(error_lines[-10:]) if error_lines else stderr[-500:]
         raise RuntimeError(f"ffmpeg failed: {error_msg}")
+
+
+def _usable_cutaways(cutaways: list[dict]) -> list[dict]:
+    """Accept local stills or videos independently; verify supplied asset hashes.
+
+    This boundary knows only local assets, never providers or search results.
+    Missing/corrupt optional visuals leave the recording visible.
+    """
+    import hashlib
+    import math
+
+    usable = []
+    for c in cutaways:
+        try:
+            start, end = float(c["start"]), float(c["end"])
+            if not math.isfinite(start) or not math.isfinite(end) or not 0 <= start < end:
+                continue
+            video, still = c.get("video"), c.get("image")
+            if video and Path(video).is_file():
+                if c.get("asset_sha256"):
+                    h = hashlib.sha256()
+                    with open(video, "rb") as f:
+                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                            h.update(chunk)
+                    if h.hexdigest() != c["asset_sha256"]:
+                        continue
+                usable.append(c)
+            elif still and Path(still).is_file():
+                usable.append(c)
+        except (OSError, TypeError, ValueError, KeyError):
+            continue
+    return usable
 
 
 def extract_clip(
@@ -2027,45 +2113,17 @@ def extract_clip(
             audiogram[0], audiogram[1], logo, logo_pos, safe_area,
             speed, af, temp_clip,
             card_fade_at=(1.8 if hook and hook.strip() else None),
-            music=music)
+            music=music, cutaways=cutaways)
     else:
         cmd = ["ffmpeg", "-ss", str(padded_start), "-i", str(source_video)]
         # Cutaways: short generated scenes spliced over the footage while the
         # audio keeps running - each is a Ken-Burnsed still shifted to its
         # window. Times are relative to this span's start.
-        # ponytail: assumes speed==1.0 (cutaway windows aren't setpts-scaled);
-        # scale the times if a sped-up show ever uses cutaways.
-        cw = [c for c in (cutaways or []) if os.path.exists(c["image"])]
+        cw = _usable_cutaways(cutaways or [])
         if (logo and os.path.exists(logo)) or cw:
             fc_parts = [f"[0:v]{vf}[base]"]
             last, idx = "base", 1
-            for k, c in enumerate(cw):
-                t0, t1 = float(c["start"]), float(c["end"])
-                d = t1 - t0
-                vid = c.get("video")
-                if vid and os.path.exists(vid):
-                    # Animated cutaway shot: cover-crop, freeze-hold if the
-                    # shot is shorter than the window, shift into place.
-                    cmd += ["-i", str(vid)]
-                    fc_parts.append(
-                        f"[{idx}:v]scale={tw}:{th}:force_original_aspect_ratio"
-                        f"=increase,crop={tw}:{th},fps=30,"
-                        f"tpad=stop_mode=clone:stop_duration=15,"
-                        f"trim=duration={d},setpts=PTS-STARTPTS+{t0}/TB[cw{k}]")
-                else:
-                    frames = max(1, round(d * 30))
-                    cmd += ["-framerate", "30", "-loop", "1", "-t", str(d),
-                            "-i", str(c["image"])]
-                    z = (f"1+0.08*on/{frames}" if k % 2 == 0
-                         else f"1.08-0.08*on/{frames}")
-                    fc_parts.append(
-                        f"[{idx}:v]zoompan=z='{z}':x='(iw-iw/zoom)/2'"
-                        f":y='(ih-ih/zoom)/2':d=1:s={tw}x{th}:fps=30,"
-                        f"trim=duration={d},setpts=PTS-STARTPTS+{t0}/TB[cw{k}]")
-                fc_parts.append(
-                    f"[{last}][cw{k}]overlay=0:0:enable="
-                    f"'between(t,{t0},{t1})':eof_action=pass[ov{k}]")
-                last, idx = f"ov{k}", idx + 1
+            last, idx = _append_cutaways(cmd, fc_parts, last, idx, cw, tw, th, speed)
             if logo and os.path.exists(logo):
                 # Overlay a fixed logo AFTER the crop (so it doesn't pan with
                 # the face track) and above cutaways, before captions. Sized to
@@ -2202,6 +2260,7 @@ def _concat_parts(parts: list[Path], output_path: Path) -> None:
             p.unlink(missing_ok=True)
 
 
+@measured("render")
 def render_clips(video_path: str, clips: list[dict], out_dir: str,
                  aspect: str = "9:16", subtitles: bool = True,
                  speed: float = 1.0, font: str | None = None,
@@ -2289,6 +2348,8 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
             {"start": clip["start"], "end": clip["end"], "words": clip.get("words")}
         ]
         parts: list[Path] = []
+        visual_sources = []
+        rendered_cutaways = []
         for ri, rng in enumerate(ranges):
             start = float(rng["start"])
             end = float(rng["end"])
@@ -2337,7 +2398,7 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                         mid = sorted(c for _, c in kf)[len(kf) // 2]  # steady: face-centered
                         crop_position = _crop_position_for_face(mid, crop_w_frac)
 
-            extract_clip(
+            extract_args = dict(
                 source_video=source,
                 start_time=start,
                 end_time=end,
@@ -2365,8 +2426,8 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                 # per-span -ss offsets if it's ever audible.
                 cta=(cta if ri == len(ranges) - 1 else None),
                 music=music,
-                cutaways=[c for c in (clip.get("cutaways") or [])
-                          if int(c.get("span", 0)) == ri],
+                cutaways=_usable_cutaways([c for c in (clip.get("cutaways") or [])
+                                          if int(c.get("span", 0)) == ri]),
                 # Lower-thirds: {"name","title","at","dur","span"} in the clip
                 # spec; "at" is seconds within its span (like cutaways).
                 speaker_tags=[s for s in (clip.get("speaker_tags") or [])
@@ -2381,12 +2442,50 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                 zoom=(1.07 if len(ranges) > 1 and ri % 2 else 1.0),
                 audio_edge_fade=len(ranges) > 1,
             )
+            from .footage_progress import report_source_credit
+            for cutaway in extract_args["cutaways"]:
+                report_source_credit(clip_id, ri, cutaway)
+            try:
+                extract_clip(**extract_args)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                if not extract_args["cutaways"]:
+                    raise
+                print("warning: cutaway composition failed; retrying with the recording",
+                      file=sys.stderr)
+                extract_args["cutaways"] = []
+                extract_clip(**extract_args)
+            visual_sources.extend({"span": ri, "start": c["start"], "end": c["end"],
+                                   **c["source"]} for c in extract_args["cutaways"]
+                                  if isinstance(c.get("source"), dict))
+            rendered_cutaways.extend({**c, "span": ri} for c in extract_args["cutaways"])
             parts.append(part_path)
 
         if len(parts) > 1:
             _concat_parts(parts, output_path)
         if not audiogram_assets:
             _apply_brand_overlays(output_path, tw, th)
+        sources_path = output_path.with_suffix(".sources.json")
+        try:
+            if visual_sources:
+                sources_path.write_text(json.dumps({"sources": visual_sources}, ensure_ascii=False,
+                                                   indent=2) + "\n", encoding="utf-8")
+            else:
+                sources_path.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"warning: could not save visual credits for {clip_id}: {e}", file=sys.stderr)
+        if "footage_coverage_report" in clip:
+            from .storyboard import footage_coverage
+            from .footage import write_json
+            report = footage_coverage({**clip, "cutaways": rendered_cutaways},
+                                      float(clip.get("footage_coverage", 0)))
+            clip["footage_coverage_report"] = report
+            try:
+                write_json(output_path.with_suffix(".coverage.json"), report)
+            except OSError as e:
+                print(f"warning: could not save footage coverage for {clip_id}: {e}", file=sys.stderr)
+            if report["achieved_percent"] + 0.1 < report["requested_percent"]:
+                print(f"warning: rendered {clip_id} has {report['achieved_percent']:g}% footage, "
+                      f"below the requested {report['requested_percent']:g}%", file=sys.stderr)
         outputs.append(str(output_path))
 
     if logo_dir:

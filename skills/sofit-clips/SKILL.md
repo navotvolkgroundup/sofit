@@ -106,6 +106,87 @@ Present the table; ask which numbers to render. Build the spec from the picks:
   `--hook-variant N` (1-based) — it writes `<id>.hookN.mp4` alongside the original.
 - This `--render-from` path is the ONLY one that honors caption fixes (`/sofit-captions`); plain `--render-clips` regenerates from the transcript.
 
+## Real web footage (optional)
+
+Requests such as "Create three social clips and use real web footage where useful"
+or "תפיק שלושה סרטוני TikTok מהפרק ותשלב צילומים אמיתיים מהרשת" use Sofit's
+native web-cutaway pipeline. Keep the usual clip-selection workflow, then:
+
+```bash
+"$SOFIT" --render-from "<episode>.clips.json" --render-clips "<out_dir>" \
+  --web-cutaways --titler claude-cli
+```
+
+- Run the CLI from the actual Sofit checkout/venv. For development, resolve `HC`
+  from the current workspace or the user's existing checkout (override the example
+  Home path), install editable with `uv pip install --python "$HC/.venv/bin/python"
+  -e "${HC}[dev,mcp,render,youtube]"`, and verify `"$PY" -c "import sofit; print(sofit.__file__)"`
+  points into that checkout. Do not silently use a global/PyPI executable.
+- Validate 2–3 representative clips before a large web-footage batch: include a
+  previous gap, partial success and a shared source. Use `--progress` and
+  `--progress-file out/progress.jsonl`; do not hide the run behind `tail`.
+  Read `footage-metrics.json` and each `.coverage.json`, then inspect actual frames.
+- Sources, frame indexes and action-specific evidence are now reused across clips.
+  A longer beat can combine several verified excerpts. Do not manufacture dozens
+  of tiny beats to compensate for selection, or subtract 0.05 seconds at exact
+  span ends; Sofit handles both cases. Preserve precise topic/action constraints.
+- Quota/authentication failures stop model requests for the run. Report the blocker
+  and coverage gaps; do not immediately retry a full episode or promise a speedup
+  based on a synthetic benchmark. Restart a small subset after service recovery.
+- Use `sofit cache status` and `sofit cache prune --dry-run` before cleanup. Pruning
+  understands legacy artifacts and protects active sessions. Never delete or move
+  an episode's output directory as a cache-cleanup workaround.
+- For audio-only sources, web mode targets 85% moving-footage coverage by default.
+  Use `--footage-coverage 90` when most of the clip should be real video; `0`
+  requests sparse cutaways (the default over an existing video). This is a target,
+  not permission to use unrelated footage. Manual plans support up to 64 beats,
+  each 2–30 seconds, including the opening and closing. Group related sentences.
+  Commons and YouTube search need no key. YouTube needs the
+  optional `youtube` extra and Deno or Node 22+. Planning and bounded frame review
+  need the configured Claude backend. If unavailable, report that the recording
+  was retained; do not claim real footage was inserted.
+- Read the surrounding episode transcript before choosing visuals. Preserve
+  `visual_context` in the spec, especially when a clip starts with pronouns or
+  statistics. The CLI reads an existing transcript cache when context is missing;
+  it does not re-transcribe. Identify the exact company, product, version and event:
+  e.g. `Figure Helix 2.5 30 homes demonstration`, not `robot home`. Put identity and
+  version in `required_terms`, and known primary publishers in `preferred_channels`.
+  These reject mismatched subjects and favor the named publisher; a channel name
+  is not verified ownership. Search can retry the same exact subject with fewer
+  action details, never replace it with a generic category. Use genuine subject
+  footage through commentary, without claiming the images prove spoken statistics.
+- For current events, preserve event names/dates in the query and context. The
+  planner can prefer recent uploads. Use `--footage-after YYYY-MM-DD` only when
+  the user supplied an appropriate cutoff; do not assume an old episode is current.
+  Unknown upload dates are excluded by this strict filter.
+- For user-supplied sources, pass repeatable `--footage-url URL` options; these
+  replace search for web beats and still require visual validation. Individual
+  YouTube/Shorts URLs and direct HTTPS video files work; arbitrary HTML pages do
+  not. Put `source_urls`, `published_after` or `prefer_recent` in a specific saved
+  visual beat when controls should apply to just that beat. Never invent URLs.
+- Default mode records rights metadata without filtering. For an explicit request
+  for a conservative rights filter, use `--web-cutaways-safe-only` instead. It
+  enables web cutaways and accepts only reported public domain, CC0 or CC BY with
+  required metadata; it is not automatic legal clearance.
+  Most YouTube videos and all bare direct-file URLs lack that metadata and will
+  be skipped in safe-only mode. Do not silently enable it for a request to use
+  general YouTube footage.
+- Add `--cutaways` only when generated-image fallback is wanted and configured.
+  Without it, low confidence or any failed provider keeps the recording.
+- Inspect real rendered frames before/during/after the insert. Check identity,
+  action, framing, original audio and Hebrew captions. Read `<clip-id>.sources.json`
+  for credits and exact source timestamps; retain that provenance with the clip.
+  Read `<clip-id>.coverage.json` for actual rendered coverage and uncovered gaps.
+  If the target was missed, report it and improve the plan/sources; do not claim
+  that a mostly static cover/logo render meets a request for mostly real video.
+- Corrected rerenders use the saved spec without the flag, reusing local assets
+  offline. To replace an old sparse/generic plan, edit or remove `visual_plan`,
+  then rerun web mode with the desired coverage. Obsolete automatic assets are
+  replaced; cutaways without a `plan_id` are manual and retain precedence.
+  Preserve caption corrections, kept spans and intentionally chosen source URLs.
+  Never download replacement footage independently and bypass the selection/cache
+  safeguards. The feature lives in the Python library/CLI, not this skill.
+
 ## 3. Log how they performed (closes the loop)
 After posting, record the numbers — this is the ONLY step that turns priors into real
 signal, and the data is perishable (unrecorded, which hook won is gone).
