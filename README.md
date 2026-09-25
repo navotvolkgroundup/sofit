@@ -208,7 +208,10 @@ chapters and Hebrew show notes for it."*
 - Input: a local mp3/mp4 file, an RSS feed URL (add `--episode N`, default latest;
   `--list-episodes` to inspect), a YouTube URL (needs `pip install 'sofit-cli[youtube]'`),
   or a direct audio URL — all cached after first fetch.
-- `--model` (default: ivrit-ai turbo), `--lang` (default `he`), `--max-chapters`,
+- `--lang {he,en}` (default `he`) sets the episode language for the transcript and
+  every generated text. To add a language, add one line to `src/sofit/languages.py`
+  (code, name, default Whisper model).
+- `--model` (default: the language's model; ivrit-ai turbo for Hebrew), `--max-chapters`,
   `--format {md,txt,youtube,spotify,podcast}`, `--embed-into AUDIO`,
   `--titler {api,claude-cli}`, `--titler-model MODEL`, `--shownotes`, `--quotes`,
   `--clips-json PATH`, `--render-clips DIR`, `--render-from PATH`, `--only ID`,
