@@ -339,7 +339,8 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve an RSS feed / audio URL to a local file (downloads + caches). A
     # local path passes through unchanged.
     try:
-        media_path = feed.resolve(args.media, episode=args.episode)
+        media_path = feed.resolve(args.media, episode=args.episode,
+                                  video=bool(args.render_clips or args.clips_json))
     except (feed.FeedError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
