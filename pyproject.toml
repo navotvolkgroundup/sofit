@@ -1,6 +1,6 @@
 [project]
 name = "sofit-cli"
-version = "0.7.0"
+version = "0.8.0"
 description = "Auto-generate chapters, show notes, and pull-quotes for Hebrew podcasts (mp3/mp4) from a local transcript."
 readme = "README.md"
 license = { text = "MIT" }
