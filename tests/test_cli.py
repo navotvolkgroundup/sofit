@@ -62,6 +62,15 @@ def test_media_required_without_render_from():
     assert cli.main([]) == 1
 
 
+def test_missing_codex_fails_before_transcription(monkeypatch, tmp_path, capsys):
+    media = tmp_path / "episode.mp3"
+    media.write_bytes(b"audio")
+    _no_transcribe(monkeypatch)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    assert cli.main([str(media), "--titler", "codex-cli"]) == 1
+    assert "codex CLI not found" in capsys.readouterr().err
+
+
 class _Seg:
     start = 0.0
     text = ""
