@@ -198,6 +198,11 @@ def main() -> int:
             for tag in tags:
                 page.keyboard.type("\n\n" if tag is tags[0] else " ")
                 page.keyboard.type(tag, delay=60)
+                # Flaky: the same clip scored 3/3 then 0/3 an hour later, and a
+                # batch came out 10/15. A retype-and-retry loop made it WORSE
+                # (0/3 every time) - the Escape that ends a failed pick leaves
+                # the editor in a state retyping does not recover. Left as the
+                # simple wait until someone can watch this headful.
                 page.wait_for_timeout(1_200)    # let the suggestion panel settle
                 n_tags += commit_tag(tag)
                 page.wait_for_timeout(300)
