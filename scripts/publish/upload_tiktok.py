@@ -113,6 +113,53 @@ def main() -> int:
             page.wait_for_timeout(300)
 
         purge_tour()
+        n_tags = 0          # set by set_caption; how many tags were committed
+
+        def _split_tags(caption: str) -> tuple[str, list[str]]:
+            """(body, hashtag tokens). Trailing hashtag-only lines come off the
+            end so they can be typed rather than pasted."""
+            lines = caption.split("\n")
+            tags: list[str] = []
+            while lines and lines[-1].strip().startswith("#"):
+                tags = lines.pop().split() + tags
+            return "\n".join(lines).rstrip(), tags
+
+        def commit_tag(tag: str) -> bool:
+            """Pick `tag` out of the '#' suggestion panel. Returns whether an
+            EXACT match was clicked.
+
+            The composer never decorates hashtags - probed 2026-09-25, Latin
+            '#fyp' and Hebrew '#אוטומציה' both land in one undecorated span - so
+            there is nothing to read back here. What the probe DID show is that
+            the suggestion panel opens, which is the only affordance for
+            actually attaching a tag; dismissing it with Escape (the earlier
+            attempt) posts the text and no tag. Only an exact match is clicked:
+            a near-miss would silently swap in a different, wrong hashtag."""
+            want = tag.lstrip("#").strip()
+            try:
+                # The panel is .mention-list-popover and its rows carry NO class
+                # of their own (dumped 2026-09-25), so rows are found by shape:
+                # the smallest descendant whose text is "#tag" + a post count.
+                row = page.evaluate_handle("""(want) => {
+                    const pop = document.querySelector('.mention-list-popover');
+                    if (!pop) return null;
+                    const hits = [...pop.querySelectorAll('*')].filter(e => {
+                        const t = (e.innerText || '').trim();
+                        return t.startsWith('#' + want) && /posts/i.test(t);
+                    });
+                    if (!hits.length) return null;
+                    hits.sort((a, b) => a.innerText.length - b.innerText.length);
+                    const first = hits[0].innerText.trim().split('\\n')[0].trim();
+                    return first === '#' + want ? hits[0] : null;
+                }""", want).as_element()
+                if row:
+                    row.click(timeout=2_000)
+                    page.wait_for_timeout(600)
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            page.keyboard.press("Escape")
+            return False
 
         # Caption: clear the auto-filled filename, insert ours ATOMICALLY
         # (char-by-char typing scrambles mixed-RTL text), then read back.
@@ -134,11 +181,27 @@ def main() -> int:
             page.wait_for_timeout(200)
             page.keyboard.press("Backspace")
             page.wait_for_timeout(400)
+            body, tags = _split_tags(post["tiktok"])
             if method == "insert":
-                page.keyboard.insert_text(post["tiktok"])
+                page.keyboard.insert_text(body)
             else:  # slow typing fallback
-                page.keyboard.type(post["tiktok"], delay=40)
+                page.keyboard.type(body, delay=40)
             page.wait_for_timeout(1_200)
+            # Hashtags have to be TYPED. insert_text lands as a paste, so DraftJS
+            # never fires its '#' handler and the tag stays plain text - verified
+            # 2026-09-25 on two live posts, whose tags sat in a bare <span> while
+            # another creator's Hebrew tags were real /tag/ links. Safe to type:
+            # the RTL scrambling that forced insert_text applies to the mixed
+            # body, not to a single unembedded token.
+            nonlocal n_tags
+            n_tags = 0
+            for tag in tags:
+                page.keyboard.type("\n\n" if tag is tags[0] else " ")
+                page.keyboard.type(tag, delay=60)
+                page.wait_for_timeout(1_200)    # let the suggestion panel settle
+                n_tags += commit_tag(tag)
+                page.wait_for_timeout(300)
+            page.wait_for_timeout(800)
 
         set_caption("insert")
         if not caption_ok():
@@ -149,6 +212,16 @@ def main() -> int:
                               "got": cap.inner_text()[:120]}, ensure_ascii=False))
             ctx.close()
             return 3
+
+        # Report, don't fail on it: a caption with dead hashtags is still worth
+        # posting, but we want to SEE it rather than find out months later.
+        # NOTE this counts suggestion-panel picks, not a readback - the composer
+        # gives no signal. Confirm on the LIVE post (its tags should be
+        # <a href="/tag/...">), not from a dry run.
+        n_want = len(_split_tags(post["tiktok"])[1])
+        if n_tags < n_want:
+            print(f"warn: only {n_tags}/{n_want} hashtags committed from the "
+                  "suggestion panel", file=sys.stderr)
 
         # Schedule: pick the radio, then fill date+time inputs.
         purge_tour()
@@ -296,7 +369,8 @@ def main() -> int:
             ctx.close()
             print(json.dumps({"status": "dry_ok", "screenshot": args.shot,
                               "clip": args.clip, "scheduled_date": sched_date,
-                              "scheduled_time": sched_time}))
+                              "scheduled_time": sched_time,
+                              "tags_registered": n_tags, "tags_wanted": n_want}))
             return 0
 
         purge_tour()
@@ -341,7 +415,8 @@ def main() -> int:
             post_url = "https://www.tiktok.com" + post_url
         import autolog
         out = {"status": "submitted" if row_ok else "submitted_unverified",
-               "clip": args.clip, "date": post["date"], "post_url": post_url}
+               "clip": args.clip, "date": post["date"], "post_url": post_url,
+               "tags_registered": n_tags, "tags_wanted": n_want}
         # Log here, not in a later step: a batch once reported 20/20 submitted
         # and logged none of it (2026-09-17).
         out.update(autolog.log(args.plan, args.clip, "tiktok", post_url))
