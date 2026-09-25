@@ -226,20 +226,27 @@ def main() -> int:
                         break
                     except Exception:  # noqa: BLE001
                         continue
+            # Read the chips back BEFORE Done, scoped to the dialog. The old
+            # check ran after Done, when the field has collapsed, and searched
+            # the WHOLE page - so it matched the handle anywhere, including the
+            # feed behind the dialog and leftover suggestion rows. It reported
+            # exactly backwards on 2026-09-25: claimed tortsuk added and
+            # navotvolk missing, while the live post had navotvolk and not
+            # tortsuk, on a clip Tor leads.
+            dlg = page.locator("[role=dialog]").last
+            collab_added = [n for n in wanted
+                            if dlg.get_by_text(n, exact=True).count()]
             page.get_by_role("button", name="Done").click(timeout=4_000)
             page.wait_for_timeout(1_200)
-            # Read the chips back instead of trusting the clicks. Appending to
-            # the list on a successful click was the old way, and it recorded
-            # intent rather than outcome.
-            collab_added = [n for n in wanted
-                            if page.get_by_text(n, exact=True).count()]
         except Exception as e:  # noqa: BLE001
             print(f"warn: collaborators step failed ({e})", file=sys.stderr)
 
         missing_collab = [n for n in wanted if n not in collab_added]
         if missing_collab:
-            print(f"warn: collaborators MISSING {missing_collab} - add them on the "
-                  f"live post with add_collaborator.py", file=sys.stderr)
+            # Best effort: a scheduled post has no URL, so the only authoritative
+            # check is the live post. Treat this as a prompt to look, not proof.
+            print(f"warn: collaborators may be MISSING {missing_collab} - confirm on "
+                  f"the live post and fix with add_collaborator.py", file=sys.stderr)
 
         # Schedule content toggle + date + time spinbuttons.
         sched_val = ""
