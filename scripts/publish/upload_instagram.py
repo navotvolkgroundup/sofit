@@ -309,6 +309,23 @@ def main() -> int:
                       if (cell) (cell.closest('[role=button]')||cell).click();
                     }""", target.day)
                 page.wait_for_timeout(1_200)
+                # The DOM walk above climbs until it finds a Sun..Sat ancestor;
+                # when it overshoots it scans too wide and the day click misses
+                # (reproducible on 2026-09-30, 2026-09-25). Retry with a role
+                # lookup scoped to the grid before giving up.
+                if not page.evaluate(
+                        """(d) => {const e=[...document.querySelectorAll('*')].find(x =>
+                             x.children.length===0 && /, \\d{4}$/.test(x.textContent.trim()));
+                           return e ? e.textContent.includes(String(d)) : false;}""",
+                        target.day):
+                    for probe in (page.get_by_role("button", name=str(target.day), exact=True),
+                                  page.get_by_role("gridcell", name=str(target.day), exact=True)):
+                        try:
+                            probe.first.click(timeout=3_000)
+                            page.wait_for_timeout(1_200)
+                            break
+                        except Exception:  # noqa: BLE001
+                            continue
                 # Hard gate: the field MUST now read the target date. IG greys
                 # out Schedule on a past date and the old code sailed past it.
                 shown_date = page.evaluate(
