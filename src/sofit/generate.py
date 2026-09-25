@@ -36,6 +36,15 @@ CLI_TIMEOUT = int(os.environ.get("SOFIT_CLI_TIMEOUT") or 900)
 # one-shot selector (`make_quotes`) and the skill's candidate-pool generator so the
 # two prompts can't drift on the contract — they already did once, with the pool
 # asking for 20-60s clips while the code clamped them at 45.
+# Navot, 2026-09-24: the show's name is always written in Hebrew in anything we
+# publish. Whisper transcribes it as "Weekly Sink"/"Weekly Sync", so without this
+# the Latin spelling leaks straight from the transcript into hooks and titles.
+BRAND_RULE = (
+    " Always write the show's name in Hebrew as 'וויקלי סינק' - never 'Weekly Sync', "
+    "'Weekly Sink' or any other Latin spelling, even when the transcript spells it "
+    "that way."
+)
+
 CLIP_RULES = (
     "Each clip MUST: (1) OPEN with a hook in its VERY FIRST sentence — a question, a "
     "bold or contrarian claim, a surprising fact, or a strong emotional moment — that "
@@ -64,8 +73,21 @@ CLIP_RULES = (
 CLIP_FIELDS = (
     "title = a punchy Hebrew hook line for the clip. It MUST be SELF-CONTAINED for "
     "a cold viewer with zero episode context: name the subject explicitly (the "
-    "person, product or movie — 'צוקרברג', not 'אתה'; 'הסרט אובססיה', not 'הסרט') "
-    "and never leave an unresolved pronoun or an unnamed 'הכלי שלי'. hook_variants = exactly 2 "
+    "product, company, movie or claim — 'אינסטינקט', not 'הכלי שלי'; 'הסרט אובססיה', "
+    "not 'הסרט') and never leave an unresolved pronoun. "
+    # Navot, 2026-09-24: "name the subject" was being satisfied by bolting the
+    # SPEAKER's name on the front - every hook came out "נבות וולק: <claim>".
+    # That is a byline, not a hook: it spends the scroll-stopping first words on
+    # attribution and states the conclusion instead of opening a gap.
+    "But the subject is the TOPIC, never the speaker. Do NOT open with a host's "
+    "name or use the 'שם הדובר: ציטוט' template - the caption credits them, the "
+    "hook does not. Put the sharpest words first, and where you can, address the "
+    "viewer's own situation so the gap is theirs to close.\n"
+    "- Weak: 'נבות וולק: \"אקס גוגל\" בלינקדאין תמיד אומר לי דבר אחד'. "
+    "Strong: 'כתבת \"אקס גוגל\" בלינקדאין? זה משדר בדיוק הפוך ממה שרצית'.\n"
+    "- Weak: 'נציג התמיכה לנבות וולק: \"אתה מטמטם אותי עם מילים\"'. "
+    "Strong: 'נציג התמיכה התקשר להתחנן שאפסיק - הוא לא ידע שהוא מתכתב עם AI'.\n"
+    "hook_variants = exactly 2 "
     "ALTERNATE Hebrew hook lines for the same moment, each taking a DIFFERENT angle "
     "from title (e.g. if title is a question, make one a bold claim and one a "
     "surprising number/fact) — they are for A/B testing which opener holds viewers. "
@@ -75,7 +97,7 @@ CLIP_FIELDS = (
     "first ~4 words of that span copied VERBATIM from the transcript and quote_end "
     "is its last ~4 words, VERBATIM. A single-span clip has one beat. For "
     "backwards compatibility you may instead give top-level quote_start/quote_end "
-    "for a one-beat clip."
+    "for a one-beat clip." + BRAND_RULE
 )
 
 
@@ -423,10 +445,36 @@ def make_chapters(segments: list[Segment], max_chapters: int = 12, titler: str =
         return []
     system = (
         "You split a Hebrew podcast transcript into chapters. Return ONLY a JSON "
-        'array: [{"title": str, "quote": str}]. title is a concise, natural Hebrew '
-        "chapter title. quote is the first 4-8 words of the transcript where that "
-        "chapter begins, copied VERBATIM so it can be found in the text. Chapters "
-        f"must be in chronological order. Return at most {max_chapters}."
+        'array: [{"title": str, "quote": str}]. quote is the first 4-8 words of the '
+        "transcript where that chapter begins, copied VERBATIM so it can be found in "
+        "the text. Chapters must be in chronological order. Return at most "
+        f"{max_chapters}.\n"
+        # Navot, 2026-09-24: the old prompt asked for "concise, natural" titles and
+        # got a table of contents - "דעות על השוק", "שאלות על AI". A chapter list is
+        # a menu a viewer scans to decide where to jump, so every line has to earn
+        # the click on its own.
+        "TITLE RULES. Each title is a specific claim, question or reveal that tells "
+        "a story - never a topic label.\n"
+        "- Name the concrete subject: the person, company, product or number the "
+        "chapter is actually about.\n"
+        "- BANNED openings and fillers: 'דעות על', 'שאלות על', 'מה קורה ב', 'דיון על', "
+        "'הכל על', 'קצת על'. A title that would still fit a different episode is wrong.\n"
+        "- Weak: 'דעות על השוק: וונדרפול, מודלים והייפ'. Strong: 'וונדרפול גייסה מיליארד "
+        "- ומה זה אומר על השוק'.\n"
+        "- Weak: 'אקס גוגל וטייטלים בלינקדאין'. Strong: 'למה \"אקס גוגל\" בלינקדאין "
+        "עובד נגדך'.\n"
+        "- Under 50 characters, or YouTube truncates it.\n"
+        "- Never promise something the chapter does not deliver, and never invent a "
+        "fact, name or number that is not said in that chapter.\n"
+        # Navot, 2026-09-24: the hook rules made titles finer-grained, and the
+        # model spent its whole budget on the first half - a 67-min episode came
+        # back with nothing after 43:00, losing one of its strongest segments.
+        "COVERAGE. The chapters must span the WHOLE episode, from the first "
+        "segment to the last. Never leave a stretch longer than about 8 minutes "
+        "without a chapter, and do not cluster them in the opening half - budget "
+        "your chapters across the full transcript BEFORE writing them. The final "
+        "chapter should sit near the end of the transcript, not in the middle."
+        + BRAND_RULE
     )
     user = f"Transcript segments:\n{_numbered(segments)}"
 
@@ -454,7 +502,7 @@ def make_shownotes(segments: list[Segment], titler: str = "api") -> dict:
     system = (
         "You write Hebrew show notes for a podcast episode. Return ONLY JSON: "
         '{"summary": str, "bullets": [str, ...]}. summary is one Hebrew paragraph; '
-        "bullets are 3-6 short Hebrew highlights."
+        "bullets are 3-6 short Hebrew highlights." + BRAND_RULE
     )
     user = " ".join(s.text for s in segments)
 
