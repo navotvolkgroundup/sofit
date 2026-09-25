@@ -297,9 +297,14 @@ def main() -> int:
         page.screenshot(path=args.shot.replace(".png", "-after.png"), full_page=True)
         ctx.close()
         ok = head in listed
+        # Log here, same as TikTok and Instagram do. Facebook was the one
+        # uploader that never called autolog, so its posts were invisible to
+        # publog and to the A/B arm counts - six WS212 rows came out TikTok-only.
+        import autolog
+        logged = autolog.log(args.plan, args.clip, "facebook", None) if ok else {}
         print(json.dumps({"status": "scheduled" if ok else "not_found_in_list",
                           "clip": args.clip, "wanted": sched,
-                          "time_listed": want_time_in(listed, hh, mi)},
+                          "time_listed": want_time_in(listed, hh, mi), **logged},
                          ensure_ascii=False))
         return 0 if ok else 8
 
