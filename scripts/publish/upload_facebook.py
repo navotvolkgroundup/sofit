@@ -79,8 +79,26 @@ def main() -> int:
             args=["--disable-blink-features=AutomationControlled"],
             viewport={"width": 1500, "height": 1050})
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto(COMPOSER, wait_until="domcontentloaded", timeout=90_000)
+        # Pin the destination. The bare composer inherits whatever asset Meta
+        # used last, so the target silently follows the session - on 2026-09-25
+        # a Weekly Sync clip filled the composer for an unrelated page. The
+        # target is config, and it is CHECKED below before anything is typed.
+        want_page = _cfg().get("fb_page_name")
+        cfg_asset = _cfg().get("fb_asset_id")
+        page.goto(f"{COMPOSER}?asset_id={cfg_asset}" if cfg_asset else COMPOSER,
+                  wait_until="domcontentloaded", timeout=90_000)
         page.wait_for_timeout(12_000)
+        if want_page:
+            shown = page.evaluate(
+                "() => { const m = document.body.innerText.match("
+                "/Share to[\\s\\S]{0,120}/); return m ? m[0] : ''; }")
+            if want_page not in shown:
+                print(json.dumps({"status": "wrong_destination",
+                                  "want": want_page,
+                                  "got": shown.replace("\n", " | ")[:120]},
+                                 ensure_ascii=False))
+                ctx.close()
+                return 4
         # The composer redirects to a URL carrying the PAGE's asset_id. Keep it:
         # the listings are per-asset, and the bare /posts/scheduled_posts lands
         # on the personal profile, whose list is empty - which read back as
