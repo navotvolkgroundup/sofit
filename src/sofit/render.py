@@ -1274,7 +1274,15 @@ def _burn_captions_pillow(video_path: Path, entries: list[dict], output_path: Pa
 
     # Static captions over non-speech footage have no spoken word to track,
     # so the karaoke highlight is just noise: SOFIT_CAPTION_ACCENT=none drops it.
-    if os.environ.get("SOFIT_CAPTION_ACCENT", "").lower() == "none":
+    # SOFIT_CAPTION_ACCENT: "" recolours the spoken word (default), "none"
+    # drops the highlight, "box" puts the word in a filled accent box and
+    # writes it in black. Navot, 2026-09-28, on a reference reel: he dislikes
+    # recolouring the word but rates the boxed treatment "האריזה מאוד טובה" -
+    # same cue, different mark, so it is an arm of ab-accent, not a
+    # replacement.
+    accent_mode = os.environ.get("SOFIT_CAPTION_ACCENT", "").lower()
+    boxed = accent_mode == "box"
+    if accent_mode == "none":
         active_color = _WHITE
     else:
         active_color = accent or _ACCENT
@@ -1348,9 +1356,23 @@ def _burn_captions_pillow(video_path: Path, entries: list[dict], output_path: Pa
                 lw = sum(word_w(w["text"]) for w in order) + space_w * (len(order) - 1)
                 x = (width - lw) / 2  # left edge of the centered line
                 for w in order:
-                    color = active_color if (w["start"] <= t < w["end"]) else _WHITE
-                    d.text((x, y), w["text"], font=pil_font, fill=color,
-                           stroke_width=outline, stroke_fill=_OUTLINE)
+                    live = w["start"] <= t < w["end"]
+                    if live and boxed:
+                        # Black on a filled accent box. No outline: the box is
+                        # the contrast, and a dark stroke muddies small glyphs.
+                        # Generous headroom: at 0.06 the box clipped the tops
+                        # of the glyphs (Navot, 2026-09-28). The box sits a
+                        # little ABOVE the ascender line, not on it.
+                        pad_x = line_h * 0.14
+                        d.rounded_rectangle(
+                            (x - pad_x, y - line_h * 0.06,
+                             x + word_w(w["text"]) + pad_x, y + line_h * 0.94),
+                            radius=line_h * 0.14, fill=active_color)
+                        d.text((x, y), w["text"], font=pil_font, fill=_OUTLINE)
+                    else:
+                        d.text((x, y), w["text"], font=pil_font,
+                               fill=active_color if live else _WHITE,
+                               stroke_width=outline, stroke_fill=_OUTLINE)
                     x += word_w(w["text"]) + space_w
                 y += line_h
 
