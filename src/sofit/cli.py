@@ -51,14 +51,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--titler",
-        choices=["api", "claude-cli"],
+        choices=["api", "claude-cli", "codex-cli"],
         default="api",
         help="generation backend: api (Anthropic API, needs ANTHROPIC_API_KEY) or "
-        "claude-cli (`claude -p`, uses your Claude Code / Pro/Max subscription, no key)",
+        "claude-cli (Claude Code subscription), or codex-cli (authenticated Codex CLI)",
     )
     p.add_argument("--titler-model", metavar="MODEL",
                    help="model for the generation backend (default: claude-sonnet-5 "
-                   "on --titler api; Claude Code's configured model on claude-cli)")
+                   "on --titler api; the backend CLI default on CLI backends)")
     p.add_argument("--shownotes", action="store_true", help="also generate Hebrew show notes")
     p.add_argument("--quotes", action="store_true", help="also extract pull-quotes")
     p.add_argument("--yt-tags", action="store_true",
@@ -334,6 +334,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.titler == "claude-cli" and not shutil.which("claude"):
         print("error: claude CLI not found — install Claude Code or use --titler api", file=sys.stderr)
+        return 1
+
+    if args.titler == "codex-cli" and not shutil.which("codex"):
+        print("error: codex CLI not found — install and authenticate Codex", file=sys.stderr)
         return 1
 
     # Resolve an RSS feed / audio URL to a local file (downloads + caches). A

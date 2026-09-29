@@ -364,3 +364,54 @@ Planned work, grounded in what's currently working for short-form social video, 
 tracked in [ROADMAP.md](ROADMAP.md).
 
 MIT licensed.
+
+### Model transports for library integrations
+
+Claude remains the default. `--titler api` uses Anthropic's API and
+`--titler claude-cli` uses the authenticated Claude CLI. The existing
+`call_claude_json` API keeps JSON validation and one retry on invalid output.
+Its optional `images` argument accepts local JPEG paths; text-only calls keep
+the existing transport behavior. Image calls use `SOFIT_VISUAL_TIMEOUT`
+(default 180 seconds), capped by `SOFIT_CLI_TIMEOUT` for CLI calls.
+
+Library integrations can register a process-local text/image transport:
+
+```python
+from sofit.model_backends import register_backend
+from sofit.generate import call_claude_json
+
+def transport(system, user, model, images=None):
+    # Call your provider and return its response text.
+    return '{"ok": true}'
+
+register_backend("example", transport, cache_key="example-v1")
+result = call_claude_json("Return JSON", "Check", lambda obj: obj,
+                          titler="example", model="your-model")
+```
+
+Use a distinct, versioned cache key when provider behavior changes. Registration
+is explicit in Python; clip specifications cannot load or register transports.
+The CLI continues to offer only its built-in providers. Unknown provider names
+raise `ValueError`.
+
+### Optional Codex backend
+
+`--titler codex-cli` explicitly selects an authenticated Codex CLI for text and
+image calls; Claude remains the default. For example:
+
+```bash
+sofit episode.mp4 --shownotes --titler codex-cli --titler-model MODEL
+```
+
+Codex sends images natively, runs in a temporary directory with a read-only
+sandbox, ignores user configuration, and disables shell, web search, MCP, hooks,
+multi-agent work and host skill discovery. It requires a CLI supporting these
+switches (original validation used 0.155.0-alpha.9.2). No OpenAI SDK or API key
+is added to Sofit; install and authenticate the CLI separately. Authentication
+and available models belong to that CLI. Omit `--titler-model` to use its default.
+There is no automatic switch to another backend on failure. CLI calls respect
+`SOFIT_CLI_TIMEOUT`; image calls additionally respect `SOFIT_VISUAL_TIMEOUT`.
+
+Library calls use `call_claude_json(..., titler="codex-cli", images=paths)` with
+the same validation/retry contract as the existing transports. Backend identity
+uses a distinct versioned cache key. This backend does not require web footage.
