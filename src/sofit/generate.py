@@ -200,18 +200,29 @@ def _client():
     return anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 
 
-def _call_api(system: str, user: str, model: str) -> str:
+def _image_content(user: str, images: list[Path]) -> list[dict]:
+    """Small local JPEG batches, shared by both existing Claude transports."""
+    import base64
+    return [{"type": "text", "text": user}] + [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+         "data": base64.b64encode(p.read_bytes()).decode()}} for p in images]
+
+
+def _call_api(system: str, user: str, model: str, images: list[Path] | None = None) -> str:
     """Transport: Anthropic API (per-token billing; needs ANTHROPIC_API_KEY)."""
+    content = _image_content(user, images) if images else user
     msg = _client().messages.create(
         model=model,
         max_tokens=4096,
         system=system,
-        messages=[{"role": "user", "content": user}],
+        messages=[{"role": "user", "content": content}],
+        **({"timeout": float(os.environ.get("SOFIT_VISUAL_TIMEOUT", "180"))} if images else {}),
     )
     return "".join(b.text for b in msg.content if b.type == "text").strip()
 
 
-def _call_claude_cli(system: str, user: str, model: str) -> str:
+def _call_claude_cli(system: str, user: str, model: str,
+                     images: list[Path] | None = None) -> str:
     """Transport: the `claude -p` CLI (uses your Claude Code / Pro/Max subscription,
     no API key). The large user text goes on stdin to dodge argv limits; the small
     system prompt rides on --append-system-prompt. By default whatever model
@@ -223,6 +234,16 @@ def _call_claude_cli(system: str, user: str, model: str) -> str:
     if not shutil.which("claude"):
         raise GenerationError("claude CLI not found — install Claude Code or use --titler api")
     cmd = ["claude", "-p", "--append-system-prompt", system, "--output-format", "text"]
+    if images:
+        # Native image input needs no filesystem/tool access. External imagery
+        # is untrusted, so disable tools, MCP, skills and hooks for this call.
+        cmd = ["claude", "-p", "--system-prompt", system, "--input-format", "stream-json",
+               "--output-format", "stream-json", "--verbose", "--tools", "",
+               "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+               "--disable-slash-commands", "--settings", '{"disableAllHooks":true}',
+               "--no-session-persistence"]
+        user = json.dumps({"type": "user", "message": {
+            "role": "user", "content": _image_content(user, images)}}) + "\n"
     if os.environ.get("SOFIT_TITLER_MODEL"):
         cmd += ["--model", model]
     # Running sofit from INSIDE Claude Code leaks that session's environment to
@@ -235,43 +256,71 @@ def _call_claude_cli(system: str, user: str, model: str) -> str:
            if k != "ANTHROPIC_BASE_URL"
            and not k.startswith(("CLAUDE_CODE_", "CLAUDE_"))
            and k not in ("CLAUDECODE", "AI_AGENT")}
+    timeout = min(CLI_TIMEOUT, float(os.environ.get("SOFIT_VISUAL_TIMEOUT", "180"))) if images else CLI_TIMEOUT
     try:
         proc = subprocess.run(
             cmd, env=env,
-            input=user, capture_output=True, text=True, timeout=CLI_TIMEOUT,
+            input=user, capture_output=True, text=True,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         # 300s was too tight for real work: a 66-min episode (981 segments) asking
         # for 8 clips x 3 hook lines each blew through it. Raise SOFIT_CLI_TIMEOUT
         # for longer episodes, or ask for fewer candidates.
         raise TimeoutError(
-            f"claude CLI exceeded {CLI_TIMEOUT}s. Raise SOFIT_CLI_TIMEOUT, ask for "
+            f"claude CLI exceeded {timeout:g}s. Raise SOFIT_CLI_TIMEOUT (or SOFIT_VISUAL_TIMEOUT for images), ask for "
             "fewer candidates (--n), or use --titler api."
         ) from None
     if proc.returncode != 0:
-        raise GenerationError(f"claude CLI failed: {(proc.stderr or '').strip()[:200]}")
+        detail = proc.stderr or proc.stdout or ""
+        if images and not proc.stderr:
+            # Stream mode puts startup events before its useful failure text.
+            try:
+                events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+                result = next(event for event in reversed(events) if event.get("type") == "result")
+                detail = str(result.get("result") or result.get("errors") or detail)
+            except (ValueError, StopIteration, AttributeError):
+                pass
+        raise GenerationError(f"claude CLI failed: {detail.strip()[:200]}")
+    if images:
+        try:
+            events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+            result = next(event for event in reversed(events) if event.get("type") == "result")
+            if result.get("is_error") or not isinstance(result.get("result"), str):
+                raise ValueError("missing successful image result")
+            return result["result"].strip()
+        except (ValueError, StopIteration, AttributeError) as e:
+            raise GenerationError("claude CLI returned no usable image result") from e
     return proc.stdout.strip()
 
 
-def call_claude_json(system: str, user: str, validate, model: str | None = None, titler: str = "api"):
-    """Call Claude, parse a JSON body, validate it, retry once on failure.
+def call_claude_json(system: str, user: str, validate, model: str | None = None,
+                     titler: str = "api", images: list[Path] | None = None):
+    """Call the selected model backend, validate JSON, retry once on invalid output.
 
-    `titler`: "api" (Anthropic API + key) or "claude-cli" (`claude -p`, subscription).
+    The historical function name is retained for library compatibility.
+
+    `titler`: "api" (Anthropic), "claude-cli", or a registered backend.
     `model`: explicit model id; falls back to the SOFIT_TITLER_MODEL env var
     (set by the --titler-model CLI flag), then the CLAUDE_MODEL default.
     `validate(obj)` must return the accepted value or raise GenerationError.
+    `images`: optional local JPEGs for bounded visual judgments; text-only
+    callers retain their existing transport behavior.
     Raises GenerationError after the retry is exhausted.
     """
-    model = model or os.environ.get("SOFIT_TITLER_MODEL") or CLAUDE_MODEL
-    transport = _call_claude_cli if titler == "claude-cli" else _call_api
+    from .model_backends import backend
+    model = model or os.environ.get("SOFIT_TITLER_MODEL") or (
+        CLAUDE_MODEL if titler in {"api", "claude-cli"} else "")
+    transport = backend(titler).transport
     last_err: Exception | None = None
     for _ in range(2):
-        text = transport(system, user, model)
+        text = (transport(system, user, model, images=images) if images
+                else transport(system, user, model))
         try:
             return validate(json.loads(_strip_fences(text)))
         except (json.JSONDecodeError, GenerationError) as e:
             last_err = e
-    raise GenerationError(f"Claude returned unusable output after retry: {last_err}")
+    raise GenerationError(f"Model returned unusable output after retry: {last_err}")
 
 
 def _strip_fences(text: str) -> str:
