@@ -17,6 +17,7 @@ Shorts); optional "youtube_description" fills the description box.
 """
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -141,6 +142,43 @@ def main() -> int:
         if desc:
             tb.nth(1).click()
             page.keyboard.insert_text(desc)
+
+        # Tags live behind "Show more" and were never filled - the pipeline has
+        # generated them since 2026-09-24 and they went nowhere (Navot,
+        # 2026-09-29). Best effort: a missing tags box must not sink the upload.
+        tags = post.get("youtube_tags", "")
+        if tags:
+            try:
+                # #toggle-button matched a DIFFERENT collapsed section, so the
+                # click "worked" and the tags stayed hidden - the timeout that
+                # followed looked like a bad tags selector but never was
+                # (probed on a real draft, 2026-09-29). Match the button by its
+                # own text; ytcp-button has no ARIA role, so get_by_role misses it.
+                page.evaluate("""() => {
+                  const b = [...document.querySelectorAll(
+                      'ytcp-button,tp-yt-paper-button,button')]
+                    .find(e => e.offsetParent && (e.innerText||'').trim() === 'Show more');
+                  if (b) b.click();
+                }""")
+                page.wait_for_timeout(2_500)
+                box = page.locator("input#text-input[aria-label='Tags']").first
+                box.click(timeout=8_000)
+                # A chip input commits a tag on each comma KEYSTROKE, so a paste
+                # leaves the counter at 0/500 - the same reason TikTok hashtags
+                # came out dead. type() is slower and is the only thing that works.
+                box.type(tags[:495], delay=2)
+                page.wait_for_timeout(1_500)
+                # The counter is the only honest readback: it reflects committed
+                # chips, not what we typed.
+                got = box.evaluate(
+                    "el => el.closest('ytcp-form-input-container').innerText")
+                used = re.search(r"(\d+)\s*/\s*500", got)
+                n = int(used.group(1)) if used else 0
+                print(f"tags: {n}/500 chars committed"
+                      f"{'' if n > 100 else '  <-- EMPTY, fill them by hand'}",
+                      file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"warn: tags not set ({str(e)[:80]})", file=sys.stderr)
 
         page.locator(
             "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']"
