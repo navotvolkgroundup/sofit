@@ -394,6 +394,7 @@ def main() -> int:
         print(json.dumps({"status": "ok", "updated": 0, "note": "nothing due"}))
         return 0
 
+    from playwright.sync_api import TimeoutError as PWTimeout
     from playwright.sync_api import sync_playwright
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -416,8 +417,21 @@ def main() -> int:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
         # Login-state check: a dead session must alert, never silently zero.
-        page.goto("https://www.tiktok.com/tiktokstudio/content",
-                  wait_until="domcontentloaded", timeout=60_000)
+        # This navigation is the scraper's most common crash: three failures in
+        # four days (2026-09-25/27/28), the last two both 60s timeouts here,
+        # while a manual rerun minutes later succeeded every time. TikTok Studio
+        # is simply slow sometimes, so retry rather than lose the day's numbers.
+        for attempt in (1, 2, 3):
+            try:
+                page.goto("https://www.tiktok.com/tiktokstudio/content",
+                          wait_until="domcontentloaded", timeout=60_000 * attempt)
+                break
+            except PWTimeout:
+                if attempt == 3:
+                    raise
+                print(f"warn: tiktokstudio timed out (attempt {attempt}), retrying",
+                      file=sys.stderr)
+                page.wait_for_timeout(5_000 * attempt)
         page.wait_for_timeout(6_000)
         def _logged_out() -> bool:
             return "/login" in page.url or "Log in" in (page.title() or "")
