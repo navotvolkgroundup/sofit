@@ -51,7 +51,10 @@ _FAL_POLL_SECONDS = 480
 # jitter lands on subpixels of the source, not visible steps.
 SCENE_W, SCENE_H = 2160, 3840
 FPS = 30
-TARGET_SCENE_SECONDS = 6.0
+# Navot, 2026-09-28: at 6s the planner filled the gaps between what was
+# actually said with invented shots. Longer scenes mean fewer of them, and
+# fewer chances to make something up. Override with SOFIT_SCENE_SECONDS.
+TARGET_SCENE_SECONDS = float(os.environ.get("SOFIT_SCENE_SECONDS") or 11.0)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +166,13 @@ def plan_scenes(words: list[dict], duration: float, characters: list[str],
     """
     n_hint = max(1, round(duration / TARGET_SCENE_SECONDS))
     timed = "\n".join(f'{float(w["t"]):.1f} {w.get("w", "")}' for w in words)
-    cast = (f"Recurring characters you may feature (use their names): "
-            f"{', '.join(characters)}. " if characters else "")
+    cast = (f"Recurring characters you may feature: {', '.join(characters)}. "
+            # A bare name in a prompt reads to the image model as text to draw,
+            # so pair it with an appearance - that survives as a description even
+            # when the name does not (see the label ban in _scene_image).
+            "Name one only alongside a short appearance description (build, hair, "
+            "clothing), and never as a caption or label. "
+            if characters else "")
     system = (
         "You storyboard short vertical social videos. Given a transcript span with "
         "per-word start times (seconds, relative to the span), split it into "
@@ -175,6 +183,16 @@ def plan_scenes(words: list[dict], duration: float, characters: list[str],
         "visual (setting, subjects, action, mood, camera angle), illustrate what "
         "is being SAID at that moment, and never contain text, captions, logos "
         "or speech bubbles. " + cast +
+        # The planner had Kobi hauling smuggled cheese through an airport - the
+        # transcript says the AMBASSADOR smuggled it. Inventing an action for a
+        # real, named person is worse than a dull picture, so it is banned
+        # outright rather than discouraged.
+        "NEVER show a named character doing something the transcript does not "
+        "say they did. If the person who acted is not one of the recurring "
+        "characters, illustrate the OBJECT or the aftermath instead of inventing "
+        "a person to perform it. Prefer an empty, concrete object shot over a "
+        "guessed scene. Stay in the setting the transcript describes; do not "
+        "move the scene to a podcast studio unless the words place it there. "
         "The transcript may be in Hebrew; the prompts must still be English."
     )
     user = f"Span duration: {duration:.1f}s\nWords:\n{timed}"
@@ -214,8 +232,23 @@ def _scene_image(prompt: str, style: str, sheet: Path | None, out_path: Path) ->
         "watermarks, no speech bubbles, no name labels."
         + (" Use the attached character reference sheet: keep every depicted "
            "character EXACTLY consistent with it (face, hair, outfit, colors). "
+           # The sheet came out right and the scenes still drifted - Gemini kept
+           # rendering Navot heavier than his reference (Navot, 2026-09-29, twice).
+           # Body shape needs saying out loud; face/hair/outfit alone did not hold it.
+           "BODY TYPE AND BUILD must match the sheet exactly too - do not make "
+           "anyone heavier, thinner, taller or older than they appear there. "
+           "Anyone NOT on the sheet is an anonymous background person: never give "
+           "them a sheet character's face. "
            "Never copy the sheet's name labels, panel layout, or plain "
-           "background into the scene."
+           "background into the scene. "
+           # "no name labels" up front did not hold: Gemini kept captioning the
+           # cast with the sheet's labels ("Navot", "Tor") along the bottom edge
+           # (Navot, 2026-09-29, twice). It reads a name in the prompt as text to
+           # draw, so say what the names are FOR, and repeat the ban last.
+           "A character's name in this prompt tells you WHO to draw - it is never "
+           "text to render. CRITICAL, this overrides everything above: the image "
+           "must contain ZERO text - no name captions under or beside the "
+           "characters, no labels, no letters, no words anywhere in the frame."
            if sheet else ""))}]
     if sheet:
         parts.append(_img_part(sheet))
@@ -446,6 +479,10 @@ def _render_span(source: Path, start: float, duration: float,
                                          accent=accent, cta=cta, clip_dur=duration)
         finally:
             temp.unlink(missing_ok=True)
+    # Storyboard clips went out unbranded: render.py applies the brand pass in
+    # its own path only, and this module never called it (Navot, 2026-09-29 -
+    # "חסר המיתוג של וויקלי סינק איפה הוא?"). Same call, same assets.
+    render._apply_brand_overlays(output_path, tw, th)
     return output_path
 
 
