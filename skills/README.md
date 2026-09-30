@@ -23,3 +23,14 @@ Then invoke them by name, e.g. `/sofit-clips`.
 setup (`HC=` the repo/venv, `LOGO=` the show wordmark). Edit those to match your machine.
 `sofit-clips` calls the bundled `sofit/clips.py` (candidate-pool → pick → clips.json helper);
 keep it alongside the `sofit` skill.
+
+The web-footage instructions in `sofit-clips` also work for agents such as Codex:
+they call the same local Python CLI and clips JSON interface, with no agent-specific
+runtime dependency. Requests for real B-roll use `--web-cutaways` after selecting
+clips. See the repository README for credentials, caching, provenance and the
+optional `--web-cutaways-safe-only` metadata policy.
+YouTube search uses the optional `youtube` extra; provided YouTube/direct-video
+links use `--footage-url`, and explicit upload-date bounds use `--footage-after`.
+Audio-only web mode targets 85% video coverage; `--footage-coverage` overrides it.
+Use episode context and exact subject/version queries, prefer primary publishers,
+and check the rendered coverage report before calling a clip complete.

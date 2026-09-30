@@ -78,6 +78,18 @@ prompt contract. Both are now single-sourced in `generate.py`:
   into both prompts. This is the exact drift that let the pool ask for 20-60s clips while
   the code clamped at 45.
 
+## Real web footage cutaways
+
+Opt-in `--web-cutaways` extends the existing visual planner and renderer with
+YouTube/Commons discovery and explicit HTTPS video links, provenance, bounded
+coarse-to-fine frame review and cached silent excerpts. Recent-upload preferences
+and an explicit date cutoff support current topics. `--web-cutaways-safe-only` adds a conservative metadata
+allowlist. Search/selection failures retain the recording or use generated art
+when enabled. Audio-only web mode targets 85% moving footage, with explicit
+coverage controls and measured render reports. Episode context, exact subject/version
+filters and publisher preferences keep discovery specific. See
+[the architecture and limits](docs/web-footage.md).
+
 ## Proposed (next)
 
 Nothing queued. The natural next input is real performance data: once clips with different
@@ -105,3 +117,10 @@ scorer learn from what actually held viewers, rather than from research priors.
     identical peaks, so there was nothing to mask.
   No code was written for this - the test ran as a throwaway ffmpeg pass, which is why
   there is nothing to revert.
+
+Batch footage acquisition now shares source indexes and versioned visual evidence,
+combines multiple verified excerpts per beat, and renders clips as ready. Progress
+and cache lifecycle commands support small cold/warm validation; see
+[performance validation](docs/footage-performance.md). Broad real-source quality
+and throughput evaluation remains necessary; fixture coverage is not a guarantee
+of equivalent coverage on arbitrary topics.

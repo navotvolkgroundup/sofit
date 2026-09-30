@@ -119,6 +119,26 @@ def _parser() -> argparse.ArgumentParser:
                    help="with --render-from: splice 1-2 short AI-illustrated "
                    "scenes over the footage at concrete visual moments "
                    "(needs GEMINI_API_KEY + a Claude backend)")
+    p.add_argument("--web-cutaways", action="store_true",
+                   help="with --render-from: find real footage on Commons and YouTube (youtube extra) "
+                   "for useful visual beats; uses the Claude backend to plan and "
+                   "inspect bounded keyframes, and caches the selected shots")
+    p.add_argument("--web-cutaways-safe-only", action="store_true",
+                   help="enable web cutaways, accepting only public-domain, CC0, "
+                   "or CC BY metadata with no reported restrictions")
+    p.add_argument("--footage-url", action="append", default=[], metavar="URL",
+                   help="enable web cutaways using these YouTube or direct HTTPS video links "
+                   "instead of search (repeat up to eight times)")
+    p.add_argument("--footage-after", metavar="YYYY-MM-DD", default="",
+                   help="enable web cutaways and require a known upload date on or after this date")
+    p.add_argument("--footage-coverage", type=float, metavar="PERCENT",
+                   help="target moving-footage coverage (0-100); default 85 for audio-only, "
+                   "0 for sparse cutaways over video. Saved manual plans are preserved")
+    p.add_argument("--progress", choices=["text", "json"], nargs="?", const="text",
+                   help="with web cutaways: live progress on stderr (JSON is one object per line)")
+    p.add_argument("--progress-file", metavar="JSONL", help="with web cutaways: append machine-readable pipeline timings/events")
+    p.add_argument("--footage-workers", type=int, default=2, metavar="N",
+                   help="bounded discovery/source worker pools (1-8; default 2)")
     p.add_argument("--animate", action="store_true",
                    help="with --storyboard: animate each scene via image-to-video "
                    "(fal.ai Kling, needs FAL_KEY; ~$0.25-0.50 per scene). Failed "
@@ -163,7 +183,11 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
                  storyboard: bool = False, style: str | None = None,
                  char_refs: dict[str, str] | None = None,
                  titler: str = "api", animate: bool = False,
-                 cutaways: bool = False) -> int:
+                 cutaways: bool = False, web_cutaways: bool = False,
+                 web_cutaways_safe_only: bool = False,
+                 footage_urls: tuple[str, ...] = (), footage_after: str = "",
+                 footage_coverage: float | None = None, progress_mode=None, progress_file=None,
+                 footage_workers: int = 2) -> int:
     """Render clips from a saved (possibly corrected) clips.json, no transcription.
     Output goes to `out_dir` if given, else the clips.json's own folder."""
     import json
@@ -196,7 +220,70 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
         return 1
 
     out = out_dir or os.path.dirname(os.path.abspath(clips_path)) or "."
-    if cutaways:
+    if web_cutaways:
+        if titler == "api" and not os.environ.get("ANTHROPIC_API_KEY"):
+            titler = "claude-cli" if shutil.which("claude") else titler
+        from . import storyboard as sb
+        try:
+            if footage_coverage is None:
+                default_coverage = 85 if render._is_audio_only(Path(video)) else 0
+                for clip in clips:
+                    clip.setdefault("footage_coverage", default_coverage)
+            if any(not c.get("visual_context") for c in clips):
+                from .transcribe import cached_segments
+                from .generate import visual_context
+                # Read the existing transcript only; rendering must never transcribe.
+                try:
+                    context_segments = cached_segments(video)
+                except (OSError, ValueError):
+                    context_segments = None
+                for clip in clips:
+                    if not clip.get("visual_context"):
+                        context = doc.get("visual_context") or (doc.get("source") or {}).get("visual_context")
+                        if not context and context_segments:
+                            spans = clip.get("segments") or [clip]
+                            context = visual_context(context_segments, min(s["start"] for s in spans),
+                                                     max(s["end"] for s in spans))
+                        if context:
+                            clip["visual_context"] = context
+            from .footage_progress import Progress, count, event
+            from .footage_pipeline import FootageSession
+            from .footage import write_json
+            progress = Progress(progress_mode, progress_file)
+            import time
+            with progress.active():
+                with FootageSession(titler=titler, workers=footage_workers,
+                        judge_workers=int(os.environ.get("SOFIT_FOOTAGE_JUDGE_WORKERS", "1")),
+                        safe_only=web_cutaways_safe_only) as session:
+                    event("planning", clips_total=len(clips))
+                    completed = time.monotonic()
+                    def ready(clip):
+                        nonlocal completed
+                        render.render_clips(video, [clip], out, aspect=aspect, logo=logo,
+                            logo_pos=logo_pos, hook_card=hook_card, hook_variant=hook_variant,
+                            hook_style=hook_style, safe_area=safe_area, cover=cover, cta=cta, music=music)
+                        count("rendered"); count("clips_done")
+                        event("rendered", clip=str(clip.get("id")), clip_seconds=round(time.monotonic()-completed, 3),
+                              coverage=clip.get("footage_coverage_report"))
+                        completed = time.monotonic()
+                        write_json(Path(clips_path), doc)
+                    n = sb.add_web_cutaways(doc, clips_path, only=only, style=style,
+                        titler=titler, generated=cutaways, animate=animate, safe_only=web_cutaways_safe_only,
+                        source_urls=footage_urls, published_after=footage_after, coverage=footage_coverage,
+                        session=session, on_clip=ready)
+                event("complete")
+                metrics = Path(out) / "footage-metrics.json"
+                try:
+                    write_json(metrics, progress.snapshot())
+                except OSError as exc:
+                    event("metrics_unavailable", reason=type(exc).__name__)
+            if progress_mode != "json":
+                print(f"added {n} web/generated cutaway(s); rendered clips as ready", file=sys.stderr)
+            return 0
+        except (OSError, ValueError) as e:
+            print(f"warning: cannot save web cutaways: {e}; continuing render", file=sys.stderr)
+        clips = [c for c in doc["clips"] if not only or c.get("id") == only]
+    elif cutaways:
         if titler == "api" and not os.environ.get("ANTHROPIC_API_KEY"):
             titler = "claude-cli" if shutil.which("claude") else titler
         if titler == "api" and not os.environ.get("ANTHROPIC_API_KEY"):
@@ -233,6 +320,12 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
                                hook_variant=hook_variant, hook_style=hook_style,
                                safe_area=safe_area,
                                cover=cover, cta=cta, music=music)
+    if web_cutaways:
+        from .footage import write_json
+        try:
+            write_json(Path(clips_path), doc)  # final coverage includes composition fallback
+        except OSError as e:
+            print(f"warning: cannot save final footage coverage: {e}", file=sys.stderr)
     print(f"rendered {len(outs)} clip(s) to {out}", file=sys.stderr)
     return 0
 
@@ -277,7 +370,29 @@ def main(argv: list[str] | None = None) -> int:
     if raw and raw[0] == "caption-check":
         return _caption_check(raw[1:])
 
+    if raw and raw[0] == "cache":
+        return _cache_command(raw[1:])
     args = _parser().parse_args(argv)
+    if args.web_cutaways_safe_only or args.footage_url or args.footage_after or args.footage_coverage is not None:
+        args.web_cutaways = True
+    if not 1 <= args.footage_workers <= 8:
+        print("error: --footage-workers must be 1..8", file=sys.stderr)
+        return 1
+    if args.footage_coverage is not None and not 0 <= args.footage_coverage <= 100:
+        print("error: --footage-coverage must be between 0 and 100", file=sys.stderr)
+        return 1
+    if args.footage_url or args.footage_after:
+        from .footage import VisualIntent, FootageError
+        try:
+            VisualIntent("validate", "validate", 3, source_urls=tuple(args.footage_url),
+                         published_after=args.footage_after)
+        except (ValueError, FootageError) as e:
+            print(f"error: invalid footage options: {e}", file=sys.stderr)
+            return 1
+    if args.web_cutaways and (not args.render_from or args.storyboard):
+        print("error: web cutaways use the recording: pass --render-from clips.json "
+              "without --storyboard (create the spec with --clips-json first)", file=sys.stderr)
+        return 1
 
     # One env var is the single override channel: every call_claude_json call
     # site (chapters, notes, quotes, clips, storyboard, cutaways) resolves it.
@@ -299,7 +414,11 @@ def main(argv: list[str] | None = None) -> int:
                             storyboard=args.storyboard, style=args.style,
                             char_refs=_parse_char_refs(args.char_ref),
                             titler=args.titler, animate=args.animate,
-                            cutaways=args.cutaways)
+                            cutaways=args.cutaways, web_cutaways=args.web_cutaways,
+                            web_cutaways_safe_only=args.web_cutaways_safe_only,
+                            footage_urls=tuple(args.footage_url), footage_after=args.footage_after,
+                            footage_coverage=args.footage_coverage, progress_mode=args.progress,
+                            progress_file=args.progress_file, footage_workers=args.footage_workers)
 
     if args.storyboard:
         print("error: --storyboard renders from a saved spec; run once to get a "
@@ -482,6 +601,26 @@ def main(argv: list[str] | None = None) -> int:
                     print("error: --render-clips needs the render extra: pip install 'sofit-cli[render]'", file=sys.stderr)
                     failed += 1
     return 1 if failed else 0
+
+
+def _cache_command(argv):
+    import json
+    from .footage import cache_dir
+    from .footage_cache import status, prune
+    parser = argparse.ArgumentParser(prog="sofit cache")
+    parser.add_argument("action", choices=["status", "prune", "clean"])
+    parser.add_argument("--max-size-mb", type=int, default=4096)
+    parser.add_argument("--max-age-days", type=float, default=30)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--temp-age-hours", type=float, default=24, help="remove temporary files older than this age")
+    args = parser.parse_args(argv)
+    if args.max_size_mb < 0 or not 0 <= args.max_age_days < float("inf") or not 0 <= args.temp_age_hours < float("inf"):
+        parser.error("cache limits must be finite and nonnegative")
+    result = status(cache_dir()) if args.action == "status" else prune(cache_dir(),
+        max_bytes=args.max_size_mb * 1024**2, max_age=args.max_age_days * 86400,
+        clean=args.action == "clean", dry_run=args.dry_run, temporary_age=args.temp_age_hours * 3600)
+    print(json.dumps(result, indent=2))
+    return 0
 
 
 if __name__ == "__main__":

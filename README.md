@@ -27,6 +27,24 @@ uses the Anthropic API and produces cleaner structured output.
 `ffmpeg` is used as a fallback decoder for exotic containers — install it if you
 hit a decode error (`brew install ffmpeg` / `apt install ffmpeg`).
 
+## Development
+
+Work from your existing checkout, with an editable install:
+
+```bash
+uv venv --python 3.12
+uv pip install --python .venv/bin/python -e '.[dev,mcp,render]'
+source .venv/bin/activate
+which sofit
+python -c "import sofit; print(sofit.__file__)"  # must be this checkout's src/sofit
+python -m pytest -q
+```
+
+Use `.venv/bin/sofit` and `.venv/bin/python` explicitly when another installation
+is on your PATH. The optional `crop` extra adds face tracking. Real rendering
+integration tests require ffmpeg/ffprobe and Pillow; other tests use mocks and
+make no network calls.
+
 ## Usage
 
 ```bash
@@ -105,6 +123,145 @@ short AI-illustrated scenes over it at concrete visual moments ("a Trojan
 horse", "a warehouse of goods") while the audio and captions run uninterrupted
 - combine with `--animate` for moving shots. Cutaways persist in the clip spec
 and cache in `<spec dir>/cutaways/`, so corrected re-renders keep them.
+
+### Real web footage cutaways (`--web-cutaways`)
+
+Keep the recording and show authentic footage where seeing the real thing adds
+information: a product demonstration, a robot in motion, a place or an event.
+YouTube and Wikimedia Commons search, subject/version matching and bounded visual
+inspection locate relevant footage; the existing renderer keeps podcast audio
+and captions. Audio-only input defaults to an **85% moving-footage target** instead
+of a mostly static cover. Recording-based clips keep the sparse two-beat default.
+Set `--footage-coverage 90` for dense coverage of either input, or `0` for sparse
+planning. Manual plans can contain up to 64 beats, each **2–30 seconds**, with no
+silent two-beat truncation. Short varied shots are usually better than long ones.
+
+```bash
+pip install 'sofit-cli[render,youtube]'
+# First select clips and save their word timings (or use an existing spec).
+sofit episode.mp4 --clips-json episode.clips.json --titler claude-cli
+sofit --render-from episode.clips.json --render-clips out \
+      --web-cutaways --titler claude-cli
+# Cover most of an audio episode with relevant source footage.
+sofit --render-from episode.clips.json --render-clips out \
+      --web-cutaways --footage-coverage 90 --titler claude-cli
+# Conservative rights-metadata allowlist; this flag also enables web cutaways.
+sofit --render-from episode.clips.json --render-clips out \
+      --web-cutaways-safe-only --titler claude-cli
+# Require a known upload date for current-event footage (adjust the date).
+sofit --render-from episode.clips.json --render-clips out \
+      --footage-after 2026-09-01 --titler claude-cli
+# Use specific YouTube or direct HTTPS video links instead of search.
+sofit --render-from episode.clips.json --render-clips out \
+      --footage-url 'https://www.youtube.com/watch?v=VIDEO_ID' --titler claude-cli
+```
+
+Needs ffmpeg/ffprobe and the existing Claude backend: a logged-in Claude Code CLI
+or `ANTHROPIC_API_KEY` with `--titler api`. Commons needs no API key or new Python
+dependency. YouTube uses the existing optional `youtube` extra (keep it updated),
+plus Deno or Node 22+ on PATH; no YouTube API key or browser cookies are needed.
+Without that extra, search uses Commons and reports the limitation. Only small sampled JPEGs and text reach Claude, never source audio
+or entire videos. `--titler-model` also controls the visual judge.
+
+Before each selected external shot is rendered, Sofit prints its clip/span timing,
+provider, source URL, reported license, creator and attribution requirements. This
+also applies to cached shots and saved-spec renders, without a progress flag.
+Unknown fields are explicitly `unknown`. JSON progress uses complete
+`source_credit` events; the credit is not truncated. This is reported metadata,
+not permission to reuse footage. Attribution is not automatically published.
+
+By default, license metadata is **recorded without filtering**; this mode does
+not establish permission to reuse a source. `--web-cutaways-safe-only` accepts
+reported public-domain/CC0 material or CC BY with creator, attribution and a
+recognized license URL, and rejects reported restrictions, unknown/custom
+licenses, NC, ND and ShareAlike. It is a metadata filter, not a rights-clearance
+service. Creator, source/media URLs, license, attribution requirements, retrieval
+time and the selected source timestamps stay in the spec and in
+`out/<clip-id>.sources.json`. Use those credits when publishing; Sofit does not
+publish or burn attribution text into the video automatically.
+
+YouTube's reported license is retained verbatim, often `unknown`; no Creative
+Commons version or permission is inferred. Safe-only therefore skips most YouTube
+videos and all bare direct-file links. Use the default `--web-cutaways` mode when
+you want those sources under your own editorial policy.
+
+For recent announcements the planner prefers uploads from the last month, then
+ranks by relevance and upload age. `--footage-after YYYY-MM-DD` is a strict lower
+bound: unknown/older dates are excluded. Upload date does not prove when an event
+occurred. `--footage-url` is repeatable (up to eight links), replaces search for
+web beats, and still requires a confident visual match. It accepts individual
+YouTube videos/Shorts and direct video files, not arbitrary HTML pages. Both options
+enable web cutaways. Saved plans support the same `source_urls`, `published_after`
+and `prefer_recent` fields. Explicit new link/date options replace assets from the
+same automatic beat; manually authored cutaways retain precedence.
+
+The editable `visual_plan` and resolved cutaways persist in the spec. Downloads
+and silent H.264 excerpts live under `$XDG_CACHE_HOME/sofit/footage` (default
+`~/.cache/sofit/footage`), outside the project. A normal `--render-from` reuses
+the assets without searching or calling a model. Remove a clip's `visual_plan`
+and its associated cutaways to replan. Missing assets fall back to the recording;
+run with `--web-cutaways` again to retrieve/resolve them.
+
+Planning uses `visual_context` around the clip, not only its isolated words.
+New specs retain nearby transcript context; existing specs read the cached
+transcript when available (never re-transcribing). Agents can supply verified
+topic context, `required_terms` (company/product/version) and `preferred_channels`
+(publisher name/handle) per beat. A discussion of Figure Helix 2.5 needs that
+release, not generic robot footage. If a detailed query finds no eligible source,
+search retries with the same exact subject/version. Publisher preference is a
+ranking signal, not proof of official ownership; use researched `source_urls`
+to pin a verified source. Repeated discovery is reused within a render run.
+
+Coverage is a target, not permission to insert unrelated footage. The CLI reports
+achieved coverage and gaps in `footage_coverage_report`; each rendered clip also
+gets a `.coverage.json` reflecting actual composition, including fallback. An
+unmet target emits a warning. Saved plans are preserved: to replace an old sparse
+plan, edit it or remove `visual_plan` to replan. Obsolete automatic assets are
+replaced; manually supplied cutaways without `plan_id` retain precedence.
+
+Add `--cutaways` to allow the existing generated-image fallback (needs
+`GEMINI_API_KEY`); add `--animate` for that fallback's optional animation.
+Search, download, low confidence or model failure otherwise keeps the recording.
+Web footage is silent, aspect-preserving and letterboxed by default; set its
+cutaway's `fit` to `cover` for a centered crop. Works with video and audiograms,
+but not the full replacement `--storyboard` mode. The feature is opt-in;
+existing commands retain their behavior.
+
+The existing Claude backends remain the defaults. Library integrations can
+register a versioned model transport with `model_backends.register_backend`;
+the existing `FrameJudge` injection remains available for other visual judges.
+Backend identity/model separates cached evidence.
+
+For batches, source downloads, frame indexes and action-specific visual evidence
+are shared across clips and persisted. A beat can use several verified excerpts;
+you do not need to split it into many tiny beats. Clips render and checkpoint as
+they become ready while later source jobs continue. Start with 2–3 representative
+clips and inspect their coverage before running a whole episode:
+
+```bash
+sofit --render-from subset.clips.json --render-clips subset-out \
+  --web-cutaways --footage-coverage 90 --titler claude-cli \
+  --footage-workers 2 --progress --progress-file subset-out/progress.jsonl
+sofit cache status
+sofit cache prune --dry-run
+```
+
+`--progress json` emits JSONL on stderr; the optional progress file records events
+in either mode. `footage-metrics.json` in the output directory summarizes timings,
+bytes, cache hits, source analyses and model calls. A quota/authentication failure
+stops further model requests for that run; cached evidence remains usable and
+uncovered sections retain the recording. Coverage targets remain targets.
+
+The managed footage cache defaults to 4 GiB and 30 days since last use; active
+sessions protect their assets from eviction. `sofit cache prune` applies those
+limits and removes stale temporary files; `sofit cache clean --dry-run` previews
+removing all managed footage. Transcript caches and final outputs are untouched.
+Pruned cutaway assets need web mode to rebuild before an offline rerender. See
+[performance validation](docs/footage-performance.md) for counters and a repeatable
+small cold/warm benchmark.
+
+See [the architecture and limits](docs/web-footage.md) for the provider/API
+contract, cost bounds and limitations.
 
 ### Close the loop: log every post (`sofit publish-log`)
 
@@ -364,3 +521,32 @@ Planned work, grounded in what's currently working for short-form social video, 
 tracked in [ROADMAP.md](ROADMAP.md).
 
 MIT licensed.
+
+### Model transports for library integrations
+
+Claude remains the default. `--titler api` uses Anthropic's API and
+`--titler claude-cli` uses the authenticated Claude CLI. The existing
+`call_claude_json` API keeps JSON validation and one retry on invalid output.
+Its optional `images` argument accepts local JPEG paths; text-only calls keep
+the existing transport behavior. Image calls use `SOFIT_VISUAL_TIMEOUT`
+(default 180 seconds), capped by `SOFIT_CLI_TIMEOUT` for CLI calls.
+
+Library integrations can register a process-local text/image transport:
+
+```python
+from sofit.model_backends import register_backend
+from sofit.generate import call_claude_json
+
+def transport(system, user, model, images=None):
+    # Call your provider and return its response text.
+    return '{"ok": true}'
+
+register_backend("example", transport, cache_key="example-v1")
+result = call_claude_json("Return JSON", "Check", lambda obj: obj,
+                          titler="example", model="your-model")
+```
+
+Use a distinct, versioned cache key when provider behavior changes. Registration
+is explicit in Python; clip specifications cannot load or register transports.
+The CLI continues to offer only its built-in providers. Unknown provider names
+raise `ValueError`.
