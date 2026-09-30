@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -114,6 +115,7 @@ def main() -> int:
 
         purge_tour()
         n_tags = 0          # set by set_caption; how many tags were committed
+        missed: list[str] = []   # which ones the suggestion panel never offered
 
         def _split_tags(caption: str) -> tuple[str, list[str]]:
             """(body, hashtag tokens). Trailing hashtag-only lines come off the
@@ -195,6 +197,7 @@ def main() -> int:
             # body, not to a single unembedded token.
             nonlocal n_tags
             n_tags = 0
+            missed.clear()
             for tag in tags:
                 page.keyboard.type("\n\n" if tag is tags[0] else " ")
                 page.keyboard.type(tag, delay=60)
@@ -203,8 +206,26 @@ def main() -> int:
                 # (0/3 every time) - the Escape that ends a failed pick leaves
                 # the editor in a state retyping does not recover. Left as the
                 # simple wait until someone can watch this headful.
-                page.wait_for_timeout(1_200)    # let the suggestion panel settle
-                n_tags += commit_tag(tag)
+                # Was a flat 1.2s sleep. The panel's latency varies, so wait
+                # for the ROW to exist instead of for the clock - the same
+                # stale-read that made the calendar overshoot. This does not
+                # touch the failed-pick path, which is what the earlier
+                # retype-and-retry attempt broke.
+                want_row = tag.lstrip("#").strip()
+                for _ in range(20):
+                    page.wait_for_timeout(200)
+                    if page.evaluate("""(want) => {
+                          const pop=document.querySelector('.mention-list-popover');
+                          if (!pop) return false;
+                          return [...pop.querySelectorAll('*')].some(e => {
+                            const t=(e.innerText||'').trim();
+                            return t.startsWith('#'+want) && /posts/i.test(t);});
+                        }""", want_row):
+                        break
+                if commit_tag(tag):
+                    n_tags += 1
+                else:
+                    missed.append(tag)
                 page.wait_for_timeout(300)
             page.wait_for_timeout(800)
 
@@ -226,7 +247,8 @@ def main() -> int:
         n_want = len(_split_tags(post["tiktok"])[1])
         if n_tags < n_want:
             print(f"warn: only {n_tags}/{n_want} hashtags committed from the "
-                  "suggestion panel", file=sys.stderr)
+                  f"suggestion panel; missed: {' '.join(missed) or '?'}",
+                  file=sys.stderr)
 
         # Schedule: pick the radio, then fill date+time inputs.
         purge_tour()
@@ -272,17 +294,92 @@ def main() -> int:
                   els[els.length - 1].click();
                   return true; }""", txt)
 
-        # Date: open the picker, click the exact valid day cell.
-        # ponytail: current-month view only (plan dates are within it); the
-        # value verification below catches any miss - add month-nav chevrons
-        # if a plan ever crosses a month boundary.
+        # Date: walk the picker to the target month, then click the day.
+        # Nine rounds went here. What was actually wrong, in order:
+        #   - .days-wrapper is a WEEK ROW, not the calendar - there are five of
+        #     them and all are visible, so .first and "last visible" both picked
+        #     an arbitrary row.
+        #   - the day cell must carry .valid. Without it a "4" from the
+        #     neighbouring month's grey trailing days matched first.
+        #   - the header separator is a NON-BREAKING space: the string reads
+        #     'September\xa0/\xa02026', so == against 'September / 2026' never
+        #     matched, the loop kept clicking forward and overshot one month per
+        #     iteration (eight iterations landed on May 2027).
+        #   - a fixed sleep after each arrow click read a stale header and
+        #     compounded the same overshoot; wait for the header to CHANGE.
         purge_tour()
         date_in = page.locator("input[value*='-']").first
         date_in.click(force=True)
-        page.wait_for_selector(".days-wrapper", timeout=8_000)
-        import re as _re
-        page.locator(".days-wrapper span.day.valid").filter(
-            has_text=_re.compile(rf"^\s*{int(dd)}\s*$")).first.click(force=True)
+        page.wait_for_selector(".calendar-wrapper", timeout=8_000)
+        page.wait_for_timeout(600)
+
+        _CAL = ("() => {const c=[...document.querySelectorAll('.calendar-wrapper')]"
+                ".filter(e=>e.offsetParent!==null)[0];"
+                " return c ? (c.innerText||'').split('\\n')[0] : '';}")
+        _norm = lambda s: re.sub(r"\s+", " ", s).strip()
+
+        def goto_month(want: str) -> bool:
+            for _ in range(14):
+                head = page.evaluate(_CAL)
+                if _norm(head) == want:
+                    return True
+                moved = page.evaluate(
+                    "() => {const c=[...document.querySelectorAll('.calendar-wrapper')]"
+                    ".filter(e=>e.offsetParent!==null)[0]; if(!c) return false;"
+                    " const a=[...c.querySelectorAll('span.arrow')];"
+                    " if(a.length<2) return false; a[a.length-1].click(); return true;}")
+                if not moved:
+                    return False
+                for _ in range(15):          # settle on the header, not the clock
+                    page.wait_for_timeout(200)
+                    if page.evaluate(_CAL) != head:
+                        break
+            return False
+
+        def click_day(day: int) -> bool:
+            # Find the cell in JS (only the DOM can tell which one is live), but
+            # click it with a REAL mouse: a synthetic el.click() left the input
+            # on today while both steps reported success (2026-09-29).
+            tagged = page.evaluate("""(day) => {
+              const c = [...document.querySelectorAll('.calendar-wrapper')]
+                .filter(e => e.offsetParent !== null)[0];
+              if (!c) return false;
+              const cell = [...c.querySelectorAll('span.day.valid')]
+                .find(e => e.textContent.trim() === String(day));
+              if (!cell) return false;
+              (cell.closest('.day-span-container') || cell)
+                .setAttribute('data-sofit-day', '1');
+              return true; }""", day)
+            if not tagged:
+                return False
+            page.locator("[data-sofit-day='1']").first.click(force=True)
+            return True
+
+        import calendar as _cal
+        want_head = f"{_cal.month_name[int(mo)]} / {yyyy}"
+        if not goto_month(want_head):
+            page.screenshot(path=args.shot)
+            print(json.dumps({"status": "month_nav_failed", "want": want_head,
+                              "saw": _norm(page.evaluate(_CAL)),
+                              "screenshot": args.shot}))
+            ctx.close()
+            return 5
+        if not click_day(int(dd)):
+            page.screenshot(path=args.shot)
+            print(json.dumps({"status": "date_cell_not_found", "day": int(dd),
+                              "screenshot": args.shot}))
+            ctx.close()
+            return 5
+        page.wait_for_timeout(800)
+        # The input is the only honest readback - the picker can close having
+        # changed nothing at all.
+        got = date_in.input_value()
+        if got != f"{yyyy}-{mo}-{dd}":
+            page.screenshot(path=args.shot)
+            print(json.dumps({"status": "date_not_set", "want": f"{yyyy}-{mo}-{dd}",
+                              "got": got, "screenshot": args.shot}))
+            ctx.close()
+            return 5
         page.wait_for_timeout(800)
 
         # Time: open the dropdown, click hour column then minute column.
@@ -400,8 +497,7 @@ def main() -> int:
         # SCHEDULED date, not creation, so a post scheduled earlier than the
         # ones already queued is not first - taking .first returned another
         # clip's URL and logged it against this one (2026-08-27).
-        post_url = page.evaluate(
-            """(head) => {
+        find_url = """(head) => {
               for (const a of document.querySelectorAll("a[href*='/video/']")) {
                 let r=a;
                 for (let i=0;i<6&&r;i++){ r=r.parentElement;
@@ -409,11 +505,24 @@ def main() -> int:
                 if (r && r.innerText.includes(head)) return a.href;
               }
               return "";
-            }""", want_head)
+            }"""
+        # The list can lag a few seconds behind the submit, so give it a couple
+        # of reloads before giving up.
+        post_url = ""
+        for attempt in range(3):
+            post_url = page.evaluate(find_url, want_head)
+            if post_url:
+                break
+            page.wait_for_timeout(4_000)
+            page.reload(wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(5_000)
         row_ok = bool(post_url)
-        if not post_url:  # keep the old behaviour as a last resort
-            first = page.locator("a[href*='/video/']").first
-            post_url = first.get_attribute("href") or ""
+        # NO first-row fallback. It used to take a[href*='/video/'] .first when
+        # the caption match failed, and the list is sorted by SCHEDULED date, so
+        # that returned a DIFFERENT clip's URL - the pins re-upload came back
+        # carrying gordon's (2026-09-30). Only autolog's duplicate check stopped
+        # it being written against pins, and that check exists for other reasons.
+        # A missing URL is recoverable by hand; a confident wrong one is not.
         page.screenshot(path=args.shot.replace(".png", "-after.png"))
         ctx.close()
         if post_url.startswith("/"):
@@ -422,9 +531,16 @@ def main() -> int:
         out = {"status": "submitted" if row_ok else "submitted_unverified",
                "clip": args.clip, "date": post["date"], "post_url": post_url,
                "tags_registered": n_tags, "tags_wanted": n_want}
+        if missed:
+            out["tags_missed"] = missed
         # Log here, not in a later step: a batch once reported 20/20 submitted
         # and logged none of it (2026-09-17).
-        out.update(autolog.log(args.plan, args.clip, "tiktok", post_url))
+        if post_url:
+            out.update(autolog.log(args.plan, args.clip, "tiktok", post_url))
+        else:
+            out["autolog"] = "skipped"
+            out["note"] = ("no row matched this caption - the post may still "
+                           "exist; check the scheduled list and log it by hand")
         print(json.dumps(out, ensure_ascii=False))
         return 0
 
