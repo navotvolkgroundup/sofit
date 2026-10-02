@@ -130,3 +130,15 @@ def test_logo_flag_passes_through_to_render(monkeypatch, tmp_path):
     assert rc == 0
     assert rendered["logo"] == str(logo)
     assert rendered["logo_pos"] == "top-right"
+
+
+def test_lang_choices_come_from_the_registry():
+    import pytest as _pytest
+    from sofit import languages
+    from sofit.cli import _parser
+
+    assert _parser().parse_args(["x.mp3", "--lang", "en"]).lang == "en"
+    with _pytest.raises(SystemExit):
+        _parser().parse_args(["x.mp3", "--lang", "xx"])
+    for code, (name, model) in languages.LANGUAGES.items():
+        assert code.isalpha() and code.islower() and name and model

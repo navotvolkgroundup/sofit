@@ -16,11 +16,11 @@ import os
 import shutil
 import sys
 
-from . import __version__
+from . import __version__, languages
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="sofit", description="Hebrew podcast episode kit.")
+    p = argparse.ArgumentParser(prog="sofit", description="Podcast episode kit (Hebrew-first; see --lang).")
     p.add_argument("media", nargs="?",
                    help="an mp3/mp4 file, an RSS feed URL, a YouTube URL, or a direct audio URL "
                    "(optional when --render-from is used)")
@@ -30,10 +30,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="list the episodes in an RSS feed and exit")
     p.add_argument(
         "--model",
-        default="ivrit-ai/whisper-large-v3-turbo-ct2",
-        help="faster-whisper model or HF ct2 repo id (default: Hebrew-tuned ivrit-ai turbo)",
+        help="faster-whisper model or HF ct2 repo id (default: the --lang language's "
+             "model in languages.py; Hebrew uses the ivrit-ai tuned turbo)",
     )
-    p.add_argument("--lang", default="he", help="transcript language (default: he)")
+    p.add_argument("--lang", default=languages.DEFAULT_LANG, choices=sorted(languages.LANGUAGES),
+                   help="episode language: transcript and all generated text "
+                        f"(default: {languages.DEFAULT_LANG}; add more in src/sofit/languages.py)")
     p.add_argument("--max-chapters", type=int, default=12)
     p.add_argument(
         "--format",
@@ -59,7 +61,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--titler-model", metavar="MODEL",
                    help="model for the generation backend (default: claude-sonnet-5 "
                    "on --titler api; Claude Code's configured model on claude-cli)")
-    p.add_argument("--shownotes", action="store_true", help="also generate Hebrew show notes")
+    p.add_argument("--shownotes", action="store_true", help="also generate show notes")
     p.add_argument("--quotes", action="store_true", help="also extract pull-quotes")
     p.add_argument("--yt-tags", action="store_true",
                    help="also generate YouTube description hashtags + the tags field "
@@ -283,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     # site (chapters, notes, quotes, clips, storyboard, cutaways) resolves it.
     if args.titler_model:
         os.environ["SOFIT_TITLER_MODEL"] = args.titler_model
+    os.environ["SOFIT_LANG"] = args.lang
+    args.model = args.model or languages.default_model(args.lang)
 
     from . import feed
 
