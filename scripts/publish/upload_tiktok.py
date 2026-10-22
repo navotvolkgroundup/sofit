@@ -5,6 +5,9 @@ Fills TikTok Studio's upload form (file, caption, schedule date/time) through
 the ws-scraper logged-in Chrome profile, then STOPS: `--dry` saves a
 confirmation screenshot and exits WITHOUT posting. Only `--submit` clicks the
 Schedule button - the human-confirm gate is the design, not a courtesy.
+In `--dry` every Schedule/Post button is disabled in the page. Scheduling
+picks Asia/Jerusalem, then the date and time, and stops if that readback
+disagrees. `--submit` is refused unless the video upload has finished.
 
     upload_tiktok.py --clip clip-12 --plan publish-plan.json --dry
     upload_tiktok.py --clip clip-12 --plan publish-plan.json --submit
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -41,6 +45,113 @@ def _publish_cfg() -> dict:
 _CFG = _publish_cfg()
 CLIPS_DIR = Path(_CFG.get("clips_dir", "~/Downloads")).expanduser()
 
+# TikTok Studio's schedule controls are English. calendar.month_name and
+# strftime follow the process locale, which would miss the readback on a
+# machine that is not set to English.
+_EN_MONTHS = (
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+_EN_MONTH_ABBR = (
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+_MENTION = re.compile(r"(?<![\w.@])@([A-Za-z0-9_.]{2,24}[A-Za-z0-9_])")
+_BIDI = re.compile("[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
+
+
+def split_tags(caption: str) -> tuple[str, list[str]]:
+    """(body, hashtag tokens). Trailing hashtag-only lines come off the
+    end so they can be typed rather than pasted."""
+    lines = caption.split("\n")
+    tags: list[str] = []
+    while lines and lines[-1].strip().startswith("#"):
+        tags = lines.pop().split() + tags
+    return "\n".join(lines).rstrip(), tags
+
+
+def split_mentions(body: str) -> list[tuple[str, str]]:
+    """[("text", run) | ("mention", handle)] in caption order."""
+    out: list[tuple[str, str]] = []
+    pos = 0
+    for match in _MENTION.finditer(body):
+        if match.start() > pos:
+            out.append(("text", body[pos:match.start()]))
+        out.append(("mention", match.group(1)))
+        pos = match.end()
+    if pos < len(body):
+        out.append(("text", body[pos:]))
+    return out
+
+
+def ordinal_day(day: int) -> str:
+    """27 -> '27th', the suffix on the day button's aria-label."""
+    if 11 <= day % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def tiktok_date_targets(date_iso: str) -> tuple[str, str, str]:
+    """(month title, day aria-label ending, combobox text).
+
+    '2026-10-27' -> ('October 2026', 'October 27th, 2026', 'Oct 27, 2026').
+    The day label is matched against the end of
+    'Tuesday, October 27th, 2026'.
+    """
+    year_s, month_s, day_s = date_iso.split("-")
+    year, month, day = int(year_s), int(month_s), int(day_s)
+    month_name = _EN_MONTHS[month]
+    return (
+        f"{month_name} {year}",
+        f"{month_name} {ordinal_day(day)}, {year}",
+        f"{_EN_MONTH_ABBR[month]} {day}, {year}",
+    )
+
+
+def strip_bidi(text: str) -> str:
+    """Drop bidi marks and collapse whitespace. Plan captions carry marks
+    the content list and the editor readback do not."""
+    return " ".join(_BIDI.sub("", text or "").split())
+
+
+def caption_url_needle(caption: str, words: int = 5) -> str:
+    """First words of a caption, for matching a row on the content list."""
+    return " ".join(_BIDI.sub("", caption or "").split()[:words])
+
+
+def body_in_editor(body: str, editor_text: str) -> bool:
+    return strip_bidi(body) in strip_bidi(editor_text)
+
+
+def schedule_readback_ok(shown_date: str, shown_time: str, shown_zone: str,
+                         date_iso: str, time_local: str) -> bool:
+    """Hard stop unless the three comboboxes show the plan.
+
+    The zone label includes the GMT offset for today ('(GMT+2) Jerusalem'
+    after the October DST change). Any label containing Jerusalem is the
+    Asia/Jerusalem zone.
+    """
+    _title, _day, want_date = tiktok_date_targets(date_iso)
+    return (shown_date == want_date and shown_time == time_local
+            and "Jerusalem" in (shown_zone or ""))
+
+
+def tiktok_dry_or_refuse(*, dry: bool, upload_broken: bool,
+                         upload_complete: bool) -> tuple[str, int] | None:
+    """(status, exit code) to stop, or None to click Schedule.
+
+    --dry never submits. A real submit is refused unless the file finished
+    uploading. upload_broken is the dry-only form check after a failed upload.
+    """
+    if dry:
+        status = "dry_ok_form_only_upload_failed" if upload_broken else "dry_ok"
+        return status, 0
+    if not upload_complete:
+        return "refused_upload_incomplete", 6
+    return None
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -62,7 +173,6 @@ def main() -> int:
         print(f"error: {video} not found", file=sys.stderr)
         return 1
     hh, mm = plan["time_local"].split(":")
-    yyyy, mo, dd = post["date"].split("-")
 
     from playwright.sync_api import sync_playwright
 
@@ -95,6 +205,20 @@ def main() -> int:
         # Wait for upload+processing (caption editor appears when ready).
         page.wait_for_selector("div[contenteditable='true']", timeout=120_000)
         page.wait_for_timeout(8_000)
+        if args.dry and os.environ.get("SOFIT_TT_FORM_ONLY"):
+            # DRY form-only mode: the "Couldn't upload" modal steals focus from
+            # the caption editor; drop it so the form can still be exercised.
+            page.evaluate("()=>document.querySelectorAll('.TUXModal-overlay').forEach(o=>{const p=o.closest('[data-floating-ui-portal]')||o; if(/upload/i.test(p.innerText)) p.remove();})")
+        if args.dry:
+            page.evaluate("""() => { const block = () => document.querySelectorAll('button').forEach(b => {
+              const t=(b.innerText||'').trim(); if (['Schedule','Post','Post now'].includes(t)) {
+              b.disabled=true; b.style.pointerEvents='none'; b.setAttribute('data-sofit-blocked','1'); } });
+              block(); if (!window.__sofitGuard) { window.__sofitGuard=new MutationObserver(block);
+              window.__sofitGuard.observe(document.body,{subtree:true,childList:true,characterData:true}); } }""")
+
+        def upload_failed() -> bool:
+            return bool(page.get_by_text("Couldn't upload").count() or
+                        page.get_by_text("Couldn\u2019t upload").count())
 
         def purge_tour():
             # First-visit tour popup ("Preview your video on your phone"):
@@ -116,15 +240,7 @@ def main() -> int:
         purge_tour()
         n_tags = 0          # set by set_caption; how many tags were committed
         missed: list[str] = []   # which ones the suggestion panel never offered
-
-        def _split_tags(caption: str) -> tuple[str, list[str]]:
-            """(body, hashtag tokens). Trailing hashtag-only lines come off the
-            end so they can be typed rather than pasted."""
-            lines = caption.split("\n")
-            tags: list[str] = []
-            while lines and lines[-1].strip().startswith("#"):
-                tags = lines.pop().split() + tags
-            return "\n".join(lines).rstrip(), tags
+        missed_mentions: list[str] = []   # @handles with no exact suggestion row
 
         def commit_tag(tag: str) -> bool:
             """Pick `tag` out of the '#' suggestion panel. Returns whether an
@@ -147,7 +263,10 @@ def main() -> int:
                     if (!pop) return null;
                     const hits = [...pop.querySelectorAll('*')].filter(e => {
                         const t = (e.innerText || '').trim();
-                        return t.startsWith('#' + want) && /posts/i.test(t);
+                        // 2026-10-22: brand-new / rare tags show no "N posts"
+                        // count, so don't require one - the exact first-line
+                        // check below still guards against near-misses.
+                        return t.startsWith('#' + want) && t.length < want.length + 60;
                     });
                     if (!hits.length) return null;
                     hits.sort((a, b) => a.innerText.length - b.innerText.length);
@@ -162,6 +281,71 @@ def main() -> int:
                 pass
             page.keyboard.press("Escape")
             return False
+
+        def refocus_editor() -> None:
+            # Clicking a suggestion row moves focus to the popover; DraftJS keeps
+            # its own selection (right after the inserted entity), so focusing
+            # the editor again resumes there. Without this the next
+            # insert_text is silently dropped (probe 2026-10-08).
+            page.evaluate(
+                "document.querySelector('div.public-DraftEditor-content').focus()")
+            page.wait_for_timeout(300)
+
+        def commit_mention(handle: str) -> bool:
+            """Type '@handle' and click the suggestion row whose user-id is
+            EXACTLY handle. Must be a real (Playwright) click: the mention
+            plugin selects on mousedown/mouseup, and a JS .click() leaves plain
+            text with no entity. Rows (dumped 2026-10-08) are
+            .mention-suggestion-item[role=option] with
+            .user-id = 'tortsuk · 52 follower'."""
+            page.keyboard.type("@" + handle, delay=80)
+            find = """(h) => {
+                const rows = [...document.querySelectorAll(
+                    '.mention-list-popover .mention-suggestion-item')];
+                return rows.find(r => ((r.querySelector('.user-id') || {})
+                    .innerText || '').split(' \u00b7 ')[0].trim() === h) || null;
+            }"""
+            row = None
+            for _ in range(30):
+                page.wait_for_timeout(250)
+                row = page.evaluate_handle(find, handle).as_element()
+                if row:
+                    break
+            if not row:
+                page.keyboard.press("Escape")
+                refocus_editor()
+                return False
+            try:
+                row.click(timeout=3_000)
+            except Exception:  # noqa: BLE001
+                refocus_editor()
+                return False
+            page.wait_for_timeout(800)
+            refocus_editor()
+            return True
+
+        def mention_entities() -> list[str]:
+            """Read-back: handles that exist as real mention ENTITIES in the
+            editor's DraftJS state (the DOM looks the same for plain text and a
+            linked mention, so the DOM can't be trusted for this)."""
+            return page.evaluate("""() => {
+                const el = document.querySelector('div.public-DraftEditor-content');
+                if (!el) return [];
+                const fk = Object.keys(el).find(k => k.startsWith('__reactFiber'));
+                let f = fk ? el[fk] : null, es = null;
+                for (let n = 0; f && n < 60; n++, f = f.return) {
+                    const p = f.memoizedProps;
+                    if (p && p.editorState) { es = p.editorState; break; }
+                }
+                if (!es) return [];
+                const c = es.getCurrentContent(), out = [];
+                c.getBlockMap().forEach(b => b.findEntityRanges(
+                    ch => ch.getEntity() !== null,
+                    (s) => { const en = c.getEntity(b.getEntityAt(s));
+                             const d = (en.getData() || {}).mention || {};
+                             if (en.getType() === 'mention' && d.uid) out.push(d.name); }));
+                return out;
+            }""")
 
         # Caption: clear the auto-filled filename, insert ours ATOMICALLY
         # (char-by-char typing scrambles mixed-RTL text), then read back.
@@ -179,15 +363,43 @@ def main() -> int:
             page.evaluate(
                 "document.querySelector('div.public-DraftEditor-content').focus()")
             page.wait_for_timeout(400)
-            page.keyboard.press("Meta+A")
+            page.keyboard.press("ControlOrMeta+A")
             page.wait_for_timeout(200)
             page.keyboard.press("Backspace")
             page.wait_for_timeout(400)
-            body, tags = _split_tags(post["tiktok"])
-            if method == "insert":
-                page.keyboard.insert_text(body)
-            else:  # slow typing fallback
-                page.keyboard.type(body, delay=40)
+            body, tags = split_tags(post["tiktok"])
+            # @mentions have to be TYPED and PICKED, exactly like hashtags: a
+            # pasted "@tortsuk" is plain text (no mention entity, nobody is
+            # tagged). So the body goes in as text runs with each @handle typed
+            # and its exact row clicked in between (2026-10-08).
+            missed_mentions.clear()
+            after_mention = False
+            for kind, chunk in split_mentions(body):
+                if kind == "mention":
+                    if not commit_mention(chunk):
+                        missed_mentions.append(chunk)
+                    after_mention = True
+                elif after_mention:
+                    # After a mention entity a multi-line insert_text keeps only
+                    # its LAST line (probe 2026-10-08), so go line by line with
+                    # a real Enter between lines. The plugin already appended a
+                    # space after the mention, so drop the run's leading one.
+                    if chunk.startswith(" "):
+                        chunk = chunk[1:]
+                    for i, line in enumerate(chunk.split("\n")):
+                        if i:
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(150)
+                        if line:
+                            if method == "insert":
+                                page.keyboard.insert_text(line)
+                            else:
+                                page.keyboard.type(line, delay=40)
+                            page.wait_for_timeout(300)
+                elif method == "insert":
+                    page.keyboard.insert_text(chunk)
+                else:  # slow typing fallback
+                    page.keyboard.type(chunk, delay=40)
             page.wait_for_timeout(1_200)
             # Hashtags have to be TYPED. insert_text lands as a paste, so DraftJS
             # never fires its '#' handler and the tag stays plain text - verified
@@ -198,9 +410,33 @@ def main() -> int:
             nonlocal n_tags
             n_tags = 0
             missed.clear()
+
+            def _caret_to_end() -> None:
+                # 2026-10-22: on clips 4/11 the tag keystrokes landed nowhere
+                # (no '#' text at all in the editor) - focus had moved off the
+                # DraftJS editor (upload status/checks re-render). Put focus
+                # and the caret back at the END before typing.
+                refocus_editor()
+                page.keyboard.press("ControlOrMeta+End")
+                page.wait_for_timeout(200)
+
+            def _editor_has(txt: str) -> bool:
+                return txt in (cap.inner_text() or "")
+
+            _caret_to_end()
             for tag in tags:
+                if not page.evaluate("() => !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('.public-DraftEditor-content'))"):
+                    _caret_to_end()
                 page.keyboard.type("\n\n" if tag is tags[0] else " ")
                 page.keyboard.type(tag, delay=60)
+                page.wait_for_timeout(400)
+                if not _editor_has(tag):
+                    # Keystrokes were lost (NOT a failed pick - nothing was typed),
+                    # so retyping is safe here; it never follows an Escape.
+                    print(f"info: {tag} keystrokes lost, refocus+retype", file=sys.stderr)
+                    _caret_to_end()
+                    page.keyboard.type(("\n\n" if tag is tags[0] and not _editor_has(tags[0]) else " ") + tag, delay=60)
+                    page.wait_for_timeout(400)
                 # Flaky: the same clip scored 3/3 then 0/3 an hour later, and a
                 # batch came out 10/15. A retype-and-retry loop made it WORSE
                 # (0/3 every time) - the Escape that ends a failed pick leaves
@@ -219,7 +455,7 @@ def main() -> int:
                           if (!pop) return false;
                           return [...pop.querySelectorAll('*')].some(e => {
                             const t=(e.innerText||'').trim();
-                            return t.startsWith('#'+want) && /posts/i.test(t);});
+                            return t.split('\\n')[0].trim()==='#'+want;});
                         }""", want_row):
                         break
                 if commit_tag(tag):
@@ -239,12 +475,43 @@ def main() -> int:
             ctx.close()
             return 3
 
+        # Mentions are NOT report-and-continue: an @handle that didn't become a
+        # linked mention entity fails the run (dry or submit) before scheduling.
+        want_mentions = [h for k, h in split_mentions(split_tags(post["tiktok"])[0])
+                         if k == "mention"]
+        if want_mentions:
+            got_mentions = mention_entities()
+            unlinked = [h for h in want_mentions if h not in got_mentions]
+            # Also make sure the multi-step insert didn't drop any body text.
+            body_ok = body_in_editor(split_tags(post["tiktok"])[0], cap.inner_text())
+            if unlinked or not body_ok:
+                # One clean redo: the body run can be cut short when TikTok
+                # re-renders mid-insert (e.g. the upload-failed modal).
+                print("info: caption check failed, redoing caption once", file=sys.stderr)
+                purge_tour()
+                set_caption("insert")
+                got_mentions = mention_entities()
+                unlinked = [h for h in want_mentions if h not in got_mentions]
+                body_ok = body_in_editor(split_tags(post["tiktok"])[0], cap.inner_text())
+            if unlinked or not body_ok:
+                page.screenshot(path=args.shot)
+                print(json.dumps({"status": "mention_not_linked" if unlinked else "caption_body_mismatch",
+                                  "mentions_wanted": want_mentions,
+                                  "mentions_linked": got_mentions,
+                                  "mentions_no_row": missed_mentions,
+                                  "body_ok": body_ok,
+                                  "screenshot": args.shot}, ensure_ascii=False))
+                ctx.close()
+                return 7
+            print(f"mentions linked: {' '.join('@' + h for h in got_mentions)}",
+                  file=sys.stderr)
+
         # Report, don't fail on it: a caption with dead hashtags is still worth
         # posting, but we want to SEE it rather than find out months later.
         # NOTE this counts suggestion-panel picks, not a readback - the composer
         # gives no signal. Confirm on the LIVE post (its tags should be
         # <a href="/tag/...">), not from a dry run.
-        n_want = len(_split_tags(post["tiktok"])[1])
+        n_want = len(split_tags(post["tiktok"])[1])
         if n_tags < n_want:
             print(f"warn: only {n_tags}/{n_want} hashtags committed from the "
                   f"suggestion panel; missed: {' '.join(missed) or '?'}",
@@ -253,26 +520,88 @@ def main() -> int:
         # Schedule: pick the radio, then fill date+time inputs.
         purge_tour()
 
+        GUARD_JS = """() => {
+          const block = () => document.querySelectorAll('button').forEach(b => {
+            const t = (b.innerText || '').trim();
+            if (['Schedule', 'Post', 'Post now'].includes(t)) {
+              b.disabled = true; b.style.pointerEvents = 'none'; b.setAttribute('data-sofit-blocked', '1'); }
+          });
+          block();
+          if (!window.__sofitGuard) { window.__sofitGuard = new MutationObserver(block);
+            window.__sofitGuard.observe(document.body, {subtree: true, childList: true, characterData: true}); }
+        }"""
+        if args.dry:
+            # DRY RUN SAFETY (2026-10-22): the old js fallback below clicked the
+            # LAST visible "Schedule" leaf - the footer submit button - and a dry
+            # run scheduled a real post. In --dry every Schedule/Post button is
+            # disabled at the DOM level for the whole session.
+            page.evaluate(GUARD_JS)
+
         def pick_schedule() -> bool:
-            for attempt in ("radio", "text", "js"):
+            # Only ever touch the RADIO. Never a generic "Schedule" text match:
+            # the footer submit button carries the same text.
+            for attempt in ("radio", "label"):
                 try:
                     if attempt == "radio":
                         page.get_by_role("radio", name="Schedule").check(force=True, timeout=4_000)
-                    elif attempt == "text":
-                        page.get_by_text("Schedule", exact=True).first.click(
-                            force=True, timeout=4_000)
                     else:
-                        page.evaluate(
-                            """() => { const els=[...document.querySelectorAll('*')]
-                            .filter(e=>e.children.length===0&&e.textContent.trim()==='Schedule'
-                                    &&e.offsetParent!==null);
-                            if(els.length) els[els.length-1].click();}""")
-                    page.wait_for_selector("input[value*='-']", timeout=6_000)
-                    return True
+                        page.evaluate("""() => { const r=[...document.querySelectorAll('input[type=radio]')]
+                          .find(i => (i.closest('label')||i.parentElement).innerText.trim()==='Schedule');
+                          if (r && !r.closest('button')) (r.closest('label')||r).click(); }""")
+                    page.wait_for_timeout(1_500)
+                    if page.evaluate("""() => [...document.querySelectorAll('input[type=radio]')]
+                          .some(i => i.checked && (i.closest('label')||i.parentElement).innerText.trim()==='Schedule')"""):
+                        return True
                 except Exception:  # noqa: BLE001
                     purge_tour()
             return False
 
+        def upload_done() -> bool:
+            return not page.get_by_text("Checks can only start after the file is uploaded").count()
+
+        def retry_upload_inline(rounds: int = 2) -> bool:
+            # 2026-10-22: TikTok's chunk upload to tos-*.tiktokcdn.com fails
+            # intermittently ("Couldn't upload"). The card has its own Retry
+            # button (NOT a submit); use it in place with spacing, rather than
+            # re-running the whole page.
+            for r in range(rounds):
+                if not upload_failed() and not page.get_by_text("Upload failed").count():
+                    break
+                page.evaluate("()=>document.querySelectorAll('.TUXModal-overlay').forEach(o=>{const p=o.closest('[data-floating-ui-portal]')||o; if(/upload/i.test(p.innerText)) p.remove();})")
+                page.wait_for_timeout(20_000 + 20_000 * r)
+                try:
+                    page.locator("button:has-text('Retry')").first.click(timeout=5_000)
+                except Exception:  # noqa: BLE001
+                    break
+                print(f"info: upload retry {r + 1}", file=sys.stderr)
+                for _ in range(60):
+                    page.wait_for_timeout(3_000)
+                    if upload_failed() or page.get_by_text("Upload failed").count():
+                        break
+                    if upload_done():
+                        break
+            for _ in range(20):
+                if upload_done() or upload_failed():
+                    break
+                page.wait_for_timeout(3_000)
+            return upload_done() and not upload_failed()
+
+        if (upload_failed() or page.get_by_text("Upload failed").count()):
+            if retry_upload_inline():
+                print("info: upload recovered via in-page Retry", file=sys.stderr)
+        upload_broken = False
+        if upload_failed() and (args.dry and os.environ.get("SOFIT_TT_FORM_ONLY")):
+            # DRY ONLY: TikTok's chunk upload failed ("Couldn't upload"), but the
+            # form still renders behind the modal. Drop the modal so the
+            # scheduling fields can be exercised; result is flagged.
+            upload_broken = True
+            page.evaluate("()=>document.querySelectorAll('.TUXModal-overlay').forEach(o=>{const p=o.closest('[data-floating-ui-portal]')||o; if(/upload/i.test(p.innerText)) p.remove();})")
+            page.keyboard.press("Escape"); page.wait_for_timeout(800)
+        elif upload_failed():
+            page.screenshot(path=args.shot)
+            print(json.dumps({"status": "upload_failed", "screenshot": args.shot}))
+            ctx.close()
+            return 6
         if not pick_schedule():
             page.screenshot(path=args.shot)
             print(json.dumps({"status": "schedule_toggle_failed",
@@ -281,200 +610,153 @@ def main() -> int:
             return 4
         page.wait_for_timeout(1_500)
 
-        def js_click_exact(txt: str) -> bool:
-            # Click the LAST visible leaf element whose text is exactly txt -
-            # picker dropdowns render after (below) the static page content.
-            return page.evaluate(
-                """(txt) => {
-                  const els = [...document.querySelectorAll('*')].filter(e =>
-                    e.children.length === 0 &&
-                    e.textContent.trim() === txt &&
-                    e.offsetParent !== null);
-                  if (!els.length) return false;
-                  els[els.length - 1].click();
-                  return true; }""", txt)
+        # ---- New scheduling UI (TikTok Studio, seen 2026-10-22) ----------
+        # Three comboboxes in [data-e2e=schedule_container]:
+        #   date  div[role=combobox][aria-label="Select date"]  -> "Oct 27, 2026"
+        #   time  div[role=combobox][aria-label="Select time"]  -> "20:00"
+        #   zone  button[role=combobox] w/ input[placeholder=Search]
+        #         default "(GMT+3) Local Time"; search offers option
+        #         data-value='"Asia/Jerusalem"'.
+        # Order matters: zone FIRST (switching zones can re-express the time),
+        # then date, then time, then read all three back.
+        # Asia/Jerusalem is an IANA zone, so TikTok applies Israel's DST
+        # switch (GMT+3 -> GMT+2 on 2026-10-25) itself; the label shows the
+        # offset for TODAY, the post lands at 20:00 Israel local on its date.
+        SC = "[data-e2e=schedule_container]"
+        DATE_CB = f"{SC} [role=combobox][aria-label='Select date']"
+        TIME_CB = f"{SC} [role=combobox][aria-label='Select time']"
+        TZ_CB = f"{SC} button[role=combobox]"
+        TZ_IN = f"{SC} input[placeholder=Search]"
+        _norm = lambda s: re.sub(r"\s+", " ", s or "").strip()
 
-        # Date: walk the picker to the target month, then click the day.
-        # Nine rounds went here. What was actually wrong, in order:
-        #   - .days-wrapper is a WEEK ROW, not the calendar - there are five of
-        #     them and all are visible, so .first and "last visible" both picked
-        #     an arbitrary row.
-        #   - the day cell must carry .valid. Without it a "4" from the
-        #     neighbouring month's grey trailing days matched first.
-        #   - the header separator is a NON-BREAKING space: the string reads
-        #     'September\xa0/\xa02026', so == against 'September / 2026' never
-        #     matched, the loop kept clicking forward and overshot one month per
-        #     iteration (eight iterations landed on May 2027).
-        #   - a fixed sleep after each arrow click read a stale header and
-        #     compounded the same overshoot; wait for the header to CHANGE.
-        purge_tour()
-        date_in = page.locator("input[value*='-']").first
-        date_in.click(force=True)
-        page.wait_for_selector(".calendar-wrapper", timeout=8_000)
-        page.wait_for_timeout(600)
-
-        _CAL = ("() => {const c=[...document.querySelectorAll('.calendar-wrapper')]"
-                ".filter(e=>e.offsetParent!==null)[0];"
-                " return c ? (c.innerText||'').split('\\n')[0] : '';}")
-        _norm = lambda s: re.sub(r"\s+", " ", s).strip()
-
-        def goto_month(want: str) -> bool:
-            for _ in range(14):
-                head = page.evaluate(_CAL)
-                if _norm(head) == want:
-                    return True
-                moved = page.evaluate(
-                    "() => {const c=[...document.querySelectorAll('.calendar-wrapper')]"
-                    ".filter(e=>e.offsetParent!==null)[0]; if(!c) return false;"
-                    " const a=[...c.querySelectorAll('span.arrow')];"
-                    " if(a.length<2) return false; a[a.length-1].click(); return true;}")
-                if not moved:
-                    return False
-                for _ in range(15):          # settle on the header, not the clock
-                    page.wait_for_timeout(200)
-                    if page.evaluate(_CAL) != head:
-                        break
-            return False
-
-        def click_day(day: int) -> bool:
-            # Find the cell in JS (only the DOM can tell which one is live), but
-            # click it with a REAL mouse: a synthetic el.click() left the input
-            # on today while both steps reported success (2026-09-29).
-            tagged = page.evaluate("""(day) => {
-              const c = [...document.querySelectorAll('.calendar-wrapper')]
-                .filter(e => e.offsetParent !== null)[0];
-              if (!c) return false;
-              const cell = [...c.querySelectorAll('span.day.valid')]
-                .find(e => e.textContent.trim() === String(day));
-              if (!cell) return false;
-              (cell.closest('.day-span-container') || cell)
-                .setAttribute('data-sofit-day', '1');
-              return true; }""", day)
-            if not tagged:
-                return False
-            page.locator("[data-sofit-day='1']").first.click(force=True)
-            return True
-
-        import calendar as _cal
-        want_head = f"{_cal.month_name[int(mo)]} / {yyyy}"
-        if not goto_month(want_head):
-            page.screenshot(path=args.shot)
-            print(json.dumps({"status": "month_nav_failed", "want": want_head,
-                              "saw": _norm(page.evaluate(_CAL)),
-                              "screenshot": args.shot}))
+        def fail(status: str, **kw) -> int:
+            page.screenshot(path=args.shot.replace(".png", f"-{status}.png"), full_page=True)
             ctx.close()
+            print(json.dumps({"status": status, "clip": args.clip, **kw}, ensure_ascii=False))
             return 5
-        if not click_day(int(dd)):
-            page.screenshot(path=args.shot)
-            print(json.dumps({"status": "date_cell_not_found", "day": int(dd),
-                              "screenshot": args.shot}))
-            ctx.close()
-            return 5
-        page.wait_for_timeout(800)
-        # The input is the only honest readback - the picker can close having
-        # changed nothing at all.
-        got = date_in.input_value()
-        if got != f"{yyyy}-{mo}-{dd}":
-            page.screenshot(path=args.shot)
-            print(json.dumps({"status": "date_not_set", "want": f"{yyyy}-{mo}-{dd}",
-                              "got": got, "screenshot": args.shot}))
-            ctx.close()
-            return 5
-        page.wait_for_timeout(800)
 
-        # Time: open the dropdown, click hour column then minute column.
-        purge_tour()
-        time_in = page.locator("input[value*=':']").first
-        time_in.click(force=True)
-        page.wait_for_timeout(1_200)
+        def close_pop():
+            page.keyboard.press("Escape"); page.wait_for_timeout(500)
 
-        def set_time_part(txt: str, part: int) -> bool:
-            # The hour and minute columns can both contain `txt` (e.g. "20"),
-            # so a blind last-match click can hit the wrong column. Click
-            # candidates from the last match backwards and verify the input
-            # actually changed the right part.
-            for nth_from_end in (1, 2, 3):
-                # The hour column is a SCROLLABLE 00-23 list: "13" sits well
-                # below the fold, and a click on an off-view row is swallowed -
-                # the field then keeps the 00:00 default (2026-09-03: clip-8
-                # shipped scheduled for midnight). Scroll the candidate into
-                # view first, then click it.
-                page.evaluate(
-                    """(a) => { const els=[...document.querySelectorAll('*')]
-                        .filter(e=>e.children.length===0 &&
-                                e.textContent.trim()===a.txt &&
-                                e.offsetParent!==null);
-                        const el=els[els.length-a.n];
-                        if(el) el.scrollIntoView({block:'center'}); }""",
-                    {"txt": txt, "n": nth_from_end})
-                page.wait_for_timeout(350)
-                page.evaluate(
-                    """(a) => { const els=[...document.querySelectorAll('*')]
-                        .filter(e=>e.children.length===0 &&
-                                e.textContent.trim()===a.txt &&
-                                e.offsetParent!==null);
-                        const el=els[els.length-a.n];
-                        if(el) el.click(); }""",
-                    {"txt": txt, "n": nth_from_end})
-                page.wait_for_timeout(400)
-                if time_in.input_value().split(":")[part] == txt:
-                    return True
-            return False
+        def read_fields() -> tuple[str, str, str]:
+            d = _norm(page.locator(DATE_CB).first.inner_text())
+            t = _norm(page.locator(TIME_CB).first.inner_text())
+            z = page.locator(TZ_IN).first.input_value() if page.locator(TZ_IN).count() else ""
+            return d, t, _norm(z)
 
-        if not set_time_part(hh, 0):
-            print("warn: hour not set", file=sys.stderr)
-        if not set_time_part(mm, 1):
-            print("warn: minute not set", file=sys.stderr)
-
-        # Clicking a row in the scrollable hour column is FLAKY - it silently
-        # leaves the 00:00 default (2026-09-03: two posts in one batch, one of
-        # which shipped scheduled for midnight). The field is readonly so it
-        # cannot be typed into; reopening the picker and retrying is what
-        # actually recovers.
-        for attempt in range(2, 5):
-            if time_in.input_value() == plan["time_local"]:
-                break
-            print(f"info: time reads {time_in.input_value()}, reopening the "
-                  f"picker (attempt {attempt})", file=sys.stderr)
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
+        # 1) Time zone -> Asia/Jerusalem
+        tz_ok = False
+        for _try in range(3):
             purge_tour()
-            time_in.click(force=True)
-            page.wait_for_timeout(1_400)
-            set_time_part(hh, 0)
-            set_time_part(mm, 1)
+            page.locator(TZ_CB).first.click()
+            page.wait_for_timeout(700)
+            page.locator(TZ_IN).first.fill("Jerusalem")
+            opt = page.locator("[role=option][data-value='\"Asia/Jerusalem\"']")
+            try:
+                opt.first.wait_for(state="visible", timeout=5_000)
+                opt.first.click()
+            except Exception:  # noqa: BLE001
+                close_pop(); continue
+            page.wait_for_timeout(800)
+            if "Jerusalem" in read_fields()[2]:
+                tz_ok = True; break
+            close_pop()
+        if not tz_ok:
+            return fail("tz_not_set", shown=read_fields()[2])
+
+        # 2) Date
+        want_month, day_label, want_date = tiktok_date_targets(post["date"])
+        date_ok = False
+        for _try in range(3):
+            purge_tour()
+            page.locator(DATE_CB).first.click()
+            try:
+                page.wait_for_selector(".DatePicker__panel", timeout=5_000)
+            except Exception:  # noqa: BLE001
+                close_pop(); continue
+            for _ in range(14):
+                head = _norm(page.locator(".DatePicker__title").first.inner_text())
+                if head == want_month:
+                    break
+                page.locator(".DatePicker__panel button[aria-label='Next month']").first.click()
+                for _w in range(15):           # wait for the header to CHANGE
+                    page.wait_for_timeout(200)
+                    if _norm(page.locator(".DatePicker__title").first.inner_text()) != head:
+                        break
+            cell = page.locator(f".DatePicker__panel button.DatePicker__day[aria-label$='{day_label}']"
+                                f"[data-outside='false']:not([disabled])")
+            if not cell.count():
+                close_pop(); continue
+            cell.first.click()
+            page.wait_for_timeout(800)
+            if page.locator(".DatePicker__panel").count() and page.locator(".DatePicker__panel").first.is_visible():
+                close_pop()
+            if read_fields()[0] == want_date:
+                date_ok = True; break
+        if not date_ok:
+            return fail("date_not_set", want=want_date, shown=read_fields()[0])
+
+        # 3) Time: two option columns, labelled "Hours HH" / "Minutes MM" (5-min steps)
+        time_ok = False
+        for _try in range(3):
+            purge_tour()
+            page.locator(TIME_CB).first.click()
+            try:
+                page.wait_for_selector(".TimePicker__panel", timeout=5_000)
+            except Exception:  # noqa: BLE001
+                close_pop(); continue
+            for lab in (f"Hours {hh}", f"Minutes {mm}"):
+                b = page.locator(f".TimePicker__panel button[role=option][aria-label='{lab}']").first
+                b.scroll_into_view_if_needed(timeout=3_000)
+                b.click()
+                page.wait_for_timeout(500)
+            close_pop()
+            if read_fields()[1] == plan["time_local"]:
+                time_ok = True; break
+        if not time_ok:
+            return fail("time_not_set", want=plan["time_local"], shown=read_fields()[1])
+
+        # Final readback - HARD STOP on any mismatch (scheduled posts can't be edited).
+        sd, st, sz = read_fields()
+        if not schedule_readback_ok(sd, st, sz, post["date"], plan["time_local"]):
+            return fail("readback_mismatch", shown=f"{sd} {st} {sz}",
+                        wanted=f"{want_date} {plan['time_local']} Jerusalem")
+        sched_date, sched_time = post["date"], st
+        # Evidence shot: caption (with mention chips) AND the schedule fields in
+        # one frame - grow the viewport, put the caption at the top.
+        try:
+            page.set_viewport_size({"width": 1500, "height": 1900})
             page.wait_for_timeout(600)
+            page.evaluate("()=>document.querySelector('div.public-DraftEditor-content').scrollIntoView({block:'start'})")
+            page.evaluate("()=>window.scrollBy(0,-120)")
+        except Exception as e:  # noqa: BLE001
+            print("warn: evidence viewport", e, file=sys.stderr)
         page.wait_for_timeout(800)
-        page.keyboard.press("Escape")  # close pickers so the shot shows values
-        page.wait_for_timeout(700)
 
-        # Verify what the fields actually hold before anyone clicks Schedule.
-        sched_date = page.locator("input[value*='-']").first.input_value()
-        sched_time = page.locator("input[value*=':']").first.input_value()
-        # A readback that disagrees with the plan is a HARD STOP, not a warning.
-        # The time columns collide (picking 13:00 can land on 00:00 when the
-        # click hits the minutes column) and on 2026-09-03 that shipped a post
-        # scheduled for midnight while the run still reported "submitted" -
-        # scheduled TikTok posts cannot be edited, so the only fix is delete +
-        # re-upload. Refuse to post rather than post at the wrong time.
-        if sched_date != post["date"] or sched_time != plan["time_local"]:
-            page.screenshot(path=args.shot.replace(".png", "-timefail.png"))
-            ctx.close()
-            print(json.dumps({"status": "time_not_set", "clip": args.clip,
-                              "wanted": f"{post['date']} {plan['time_local']}",
-                              "shown": f"{sched_date} {sched_time}"},
-                             ensure_ascii=False))
-            return 4
-
-        page.screenshot(path=args.shot, full_page=False)
+        # Don't call a dry run done while the video is still uploading.
+        for _ in range(40):
+            if upload_done() or upload_failed():
+                break
+            page.wait_for_timeout(3_000)
+        upload_complete = upload_done() and not upload_failed() and not upload_broken
+        page.screenshot(path=args.shot)
+        gate = tiktok_dry_or_refuse(
+            dry=args.dry, upload_broken=upload_broken, upload_complete=upload_complete)
         if args.dry:
+            linked = mention_entities()
             ctx.close()
-            print(json.dumps({"status": "dry_ok", "screenshot": args.shot,
+            print(json.dumps({"status": gate[0], "screenshot": args.shot,
                               "clip": args.clip, "scheduled_date": sched_date,
-                              "scheduled_time": sched_time,
-                              "tags_registered": n_tags, "tags_wanted": n_want}))
-            return 0
+                              "scheduled_time": sched_time, "shown": f"{sd} {st} {sz}",
+                              "tags_registered": n_tags, "tags_wanted": n_want, "tags_missed": missed,
+                              "upload_complete": upload_complete, "mentions_linked": linked}))
+            return gate[1]
 
+        # Never submit a post whose video didn't finish uploading.
+        if gate is not None:
+            ctx.close()
+            print(json.dumps({"status": gate[0], "clip": args.clip}))
+            return gate[1]
         purge_tour()
         page.get_by_role("button", name="Schedule").click(force=True)
         page.wait_for_timeout(4_000)
@@ -497,12 +779,22 @@ def main() -> int:
         # SCHEDULED date, not creation, so a post scheduled earlier than the
         # ones already queued is not first - taking .first returned another
         # clip's URL and logged it against this one (2026-08-27).
+        # Bidi marks (RLE/PDF/LRE/RLO/LRO, RLM/LRM/ALM, isolates U+2066-2069) are
+        # in the plan caption (rtl_caption) but NOT in the content-list text, so
+        # strip them - and collapse whitespace - on BOTH sides before matching.
+        # The needle is the caption's first words. `want_head` is only the
+        # first token, and it used to be overwritten with the month title.
+        url_needle = caption_url_needle(post["tiktok"])
         find_url = """(head) => {
+              const norm = s => (s || "")
+                .replace(/[\\u200e\\u200f\\u061c\\u202a-\\u202e\\u2066-\\u2069]/g, "")
+                .replace(/\\s+/g, " ").trim();
+              const want = norm(head);
               for (const a of document.querySelectorAll("a[href*='/video/']")) {
                 let r=a;
                 for (let i=0;i<6&&r;i++){ r=r.parentElement;
                   if (r && r.innerText && r.innerText.length>60) break; }
-                if (r && r.innerText.includes(head)) return a.href;
+                if (r && norm(r.innerText).includes(want)) return a.href;
               }
               return "";
             }"""
@@ -510,7 +802,7 @@ def main() -> int:
         # of reloads before giving up.
         post_url = ""
         for attempt in range(3):
-            post_url = page.evaluate(find_url, want_head)
+            post_url = page.evaluate(find_url, url_needle)
             if post_url:
                 break
             page.wait_for_timeout(4_000)

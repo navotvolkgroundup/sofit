@@ -3,7 +3,9 @@
 
 Same human-confirm design as upload_tiktok.py: --dry fills everything
 (file, caption, collaborators, schedule) and screenshots WITHOUT sharing;
-only --submit clicks Share.
+only --submit clicks Share. The day click skips grid cells the calendar
+marks disabled (the greyed-out days of the adjacent month). `--trial`
+turns on Trial Reels and exits 8 unless that toggle reads back on.
 
     upload_instagram.py --clip clip-12 --plan publish-plan.json --dry
 """
@@ -44,6 +46,11 @@ CLIPS_DIR = Path(_CFG.get("clips_dir", "~/Downloads")).expanduser()
 COLLABORATORS = _CFG.get("ig_collaborators", [])
 
 
+def trial_unavailable(requested: bool, state: str | None) -> bool:
+    """--trial never falls through to a normal post. The toggle must read ON."""
+    return bool(requested) and state != "true"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", required=True)
@@ -52,6 +59,9 @@ def main() -> int:
     g.add_argument("--dry", action="store_true")
     g.add_argument("--submit", action="store_true")
     ap.add_argument("--shot", default="/tmp/ig-upload-preview.png")
+    ap.add_argument("--trial", action="store_true",
+                    help="post as a Trial Reel (non-followers first); hard-fails (exit 8) "
+                         "if the Trial control can't be found and read back ON")
     args = ap.parse_args()
 
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
@@ -312,7 +322,9 @@ def main() -> int:
                       const cell=[...root.querySelectorAll('*')].find(x =>
                         x.children.length===0 && x.textContent.trim()===String(d) &&
                         x.offsetParent!==null &&
-                        getComputedStyle(x).cursor !== 'not-allowed');
+                        getComputedStyle(x).cursor !== 'not-allowed' &&
+                        !(x.closest('[role=gridcell]') &&
+                          x.closest('[role=gridcell]').getAttribute('aria-disabled')==='true'));
                       if (cell) (cell.closest('[role=button]')||cell).click();
                     }""", target.day)
                 page.wait_for_timeout(1_200)
@@ -325,8 +337,8 @@ def main() -> int:
                              x.children.length===0 && /, \\d{4}$/.test(x.textContent.trim()));
                            return e ? e.textContent.includes(String(d)) : false;}""",
                         target.day):
-                    for probe in (page.get_by_role("button", name=str(target.day), exact=True),
-                                  page.get_by_role("gridcell", name=str(target.day), exact=True)):
+                    for probe in (page.locator("[role=gridcell]:not([aria-disabled=true])", has_text=re.compile(rf"^{target.day}$")),
+                                  page.get_by_role("button", name=str(target.day), exact=True)):
                         try:
                             probe.first.click(timeout=3_000)
                             page.wait_for_timeout(1_200)
@@ -444,6 +456,45 @@ def main() -> int:
                     fb_state = "control_not_found"
             except Exception as e:  # noqa: BLE001
                 fb_state = f"failed: {str(e)[:60]}"
+        # Trial Reels (2026-10-16): find the Trial toggle on the share form,
+        # switch it ON and READ IT BACK. Never fall through to a regular post.
+        trial_state = None
+        if args.trial:
+            try:
+                form_txt = page.evaluate("() => document.body.innerText.replace(/\\s+/g,' ').slice(0,4000)")
+                Path("/tmp/ig-trial-form.txt").write_text(form_txt, encoding="utf-8")
+                for lbl in ("Advanced settings", "Advanced Settings"):
+                    if page.get_by_text(lbl, exact=True).count():
+                        page.get_by_text(lbl, exact=True).first.click(timeout=4_000)
+                        page.wait_for_timeout(1_500)
+                page.evaluate("""() => { const d=document.querySelector('div[role=dialog]'); if(!d) return;
+                    d.querySelectorAll('*').forEach(e=>{ if(e.scrollHeight>e.clientHeight+20) e.scrollTop=e.scrollHeight; }); }""")
+                page.wait_for_timeout(1_200)
+                dlg = page.evaluate("() => { const d=document.querySelector('div[role=dialog]'); return d ? d.innerText : ''; }")
+                Path("/tmp/ig-trial-dialog.txt").write_text(dlg, encoding="utf-8")
+                page.screenshot(path="/tmp/ig-trial-dialog.png")
+                tog = None
+                for rx in ("Trial", "non-followers", "Share to non-followers first"):
+                    rows = page.locator(f"div:has-text('{rx}'):has([role=switch]), label:has-text('{rx}'):has(input[type=checkbox])")
+                    if rows.count():
+                        cand = rows.last.locator("[role=switch], input[type=checkbox]").first
+                        if cand.count():
+                            tog = cand; break
+                if tog is None:
+                    trial_state = "control_not_found"
+                else:
+                    if (tog.get_attribute("aria-checked") or str(tog.is_checked()).lower()) != "true":
+                        tog.click(timeout=6_000); page.wait_for_timeout(1_200)
+                    trial_state = tog.get_attribute("aria-checked") or str(tog.is_checked()).lower()
+            except Exception as e:  # noqa: BLE001
+                trial_state = f"failed: {str(e)[:80]}"
+            if trial_unavailable(args.trial, trial_state):
+                page.screenshot(path=args.shot, full_page=False)
+                ctx.close()
+                print(json.dumps({"status": "trial_unavailable", "trial": trial_state,
+                                  "clip": args.clip, "screenshot": args.shot,
+                                  "form_dump": "/tmp/ig-trial-form.txt"}, ensure_ascii=False))
+                return 8
         page.screenshot(path=args.shot, full_page=False)
 
         if args.dry:
@@ -451,7 +502,7 @@ def main() -> int:
             print(json.dumps({"status": "dry_ok", "screenshot": args.shot,
                               "clip": args.clip, "collaborators": collab_added,
                               "collaborators_missing": missing_collab,
-                              "cover_set": cover_set, "facebook": fb_state,
+                              "cover_set": cover_set, "facebook": fb_state, "trial": trial_state if args.trial else None,
                               "schedule_fields": sched_val},
                              ensure_ascii=False))
             return 0
