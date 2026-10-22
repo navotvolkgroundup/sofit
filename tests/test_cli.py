@@ -1,6 +1,9 @@
 """CLI --render-from tests: render from a saved clips.json without transcribing."""
 
 import json
+import shutil
+
+import pytest
 
 from sofit import cli
 
@@ -154,6 +157,7 @@ def test_defiller_dry_run_reports_without_rendering(monkeypatch, tmp_path, capsy
     assert any(ln.strip().startswith("keep") and "אם" in ln.split() for ln in out.splitlines())
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 def test_defiller_dry_run_reports_an_audio_hum(monkeypatch, tmp_path, capsys):
     # No filler tokens. The hum is only in the audio, which is the Weekly
     # Sync case: ivrit-ai writes none of them.

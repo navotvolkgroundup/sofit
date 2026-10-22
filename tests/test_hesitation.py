@@ -6,6 +6,7 @@ silent pause are not. The cut is the hum, not the gap it sat in.
 
 import math
 import random
+import shutil
 import struct
 import wave
 
@@ -13,6 +14,10 @@ import pytest
 
 from sofit.defiller import DefillerConfig, format_report, plan_defill
 
+
+# read_pcm decodes through ffmpeg, which CI does not install — same guard
+# the render tests use. The synthetic-PCM tests below need no decoder.
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 
 SR = 8000
 
@@ -203,6 +208,7 @@ def test_hum_beside_speech_is_kept_until_silence_separates_them():
     assert plan.cuts[0][1] < 1.10
 
 
+@needs_ffmpeg
 def test_dry_run_report_lists_audio_source_and_confidence(tmp_path):
     # The wav is the source file. The clip starts 1s in, which is how a
     # dry run seeks: span-relative words, absolute timestamps in the report.
