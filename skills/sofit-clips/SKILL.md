@@ -112,6 +112,8 @@ Present the table; ask which numbers to render. Build the spec from the picks:
   `SOFIT_FPS` when that override is set) so xfade does not reject 50fps
   footage. The dissolve itself is a whole number of those frames — a 0.02s
   fade at 25fps is half a frame and was ending the picture at the join.
+  The encode stops at the post-cut length. A looped logo (and the badge/frame
+  pass) was holding the last frame out to the uncut span.
   `--no-defiller` keeps every hesitation. `--defiller-dry-run` prints each
   candidate with its source timestamp, `id=m:ss.ss`, `word` or `audio`, and
   a confidence, and does not render. `--defiller-min-gap 0.40` (the default)

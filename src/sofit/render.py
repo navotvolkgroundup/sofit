@@ -1534,9 +1534,17 @@ def _apply_brand_overlays(output_path: Path, width: int, height: int) -> None:
         filters.append(f"[{last}][f]overlay=0:0:eof_action=pass[v{idx}]")
         last = f"v{idx}"
     tmp = output_path.with_suffix(".brand.mp4")
+    # Stop with the clip we were given. A frame longer than the footage, or a
+    # still that ffmpeg keeps repeating, otherwise holds the last frame and
+    # the file grows. By this pass the clip is already the post-cut length.
+    _video, _audio, _box = _probe_av_durations(output_path)
+    cap = max((d for d in (_video, _audio, _box) if d), default=None)
     cmd = ["ffmpeg", "-v", "error", *inputs,
            "-filter_complex", ";".join(filters),
-           "-map", f"[{last}]", "-map", "0:a?",
+           "-map", f"[{last}]", "-map", "0:a?"]
+    if cap:
+        cmd += ["-t", f"{cap:.6f}"]
+    cmd += [
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium",
            "-crf", "20", "-c:a", "copy", "-movflags", "+faststart",
            "-y", str(tmp)]
@@ -2171,30 +2179,44 @@ def _duration_mismatch(video: float | None, audio: float | None, expected: float
                        container: float | None = None) -> str | None:
     """A loud description when either stream misses `expected`, else None."""
     problems: list[str] = []
+    def off(actual: float) -> str:
+        delta = actual - expected
+        if delta > 0:
+            return f"{actual:.3f}s, {delta:.3f}s longer"
+        return f"{actual:.3f}s, {-delta:.3f}s shorter"
+
     if video is None:
         problems.append("video duration unreadable")
     elif abs(video - expected) > tolerance:
-        problems.append(f"video {video:.3f}s")
+        problems.append(f"video {off(video)}")
     if audio is None:
         problems.append("audio duration unreadable")
     elif abs(audio - expected) > tolerance:
-        problems.append(f"audio {audio:.3f}s")
+        problems.append(f"audio {off(audio)}")
     if not problems:
         return None
     box = "unreadable" if container is None else f"{container:.3f}s"
+    if video is not None and video > expected + tolerance:
+        why = "The picture ran long; an overlay held it past the splice."
+    elif video is not None and video < expected - tolerance:
+        why = "The picture stopped early at a splice join."
+    else:
+        why = "A stream does not match the splice clock."
     return (
         f"rendered duration mismatch: expected {expected:.3f}s "
         f"(±{tolerance:.3f}s), got {', '.join(problems)}; "
-        f"container {box}. The picture stopped early at a splice join."
+        f"container {box}. {why}"
     )
 
 
 def _assert_rendered_duration(path: Path, expected: float,
                               tolerance: float = _SPLICE_DURATION_TOLERANCE) -> None:
-    """Fail the render when the file is shorter than the splice clock.
+    """Fail the render when either stream misses the splice clock.
 
-    Both streams are checked. Container duration follows the audio and hid
-    joins where the video had already ended.
+    Too short is a join that dropped the rest of the picture. Too long is an
+    overlay (a looped logo, a long frame) holding the last frame out to the
+    uncut span. Container duration follows whichever stream is longer, so
+    both streams are checked.
     """
     video, audio, container = _probe_av_durations(path)
     message = _duration_mismatch(video, audio, expected, tolerance, container)
@@ -2502,13 +2524,20 @@ def extract_clip(
                                                        safe_area)
                 cmd += ["-loop", "1", "-i", str(logo)]
                 fc_parts.append(f"[{idx}:v]scale={lw}:-1[lg]")
-                fc_parts.append(f"[{last}][lg]overlay={pos}:format=auto[vout]")
+                # shortest: the logo is -loop 1, so without this the overlay
+                # outlives the footage and holds the last frame.
+                fc_parts.append(
+                    f"[{last}][lg]overlay={pos}:format=auto:shortest=1[vout]")
                 last = "vout"
             if layout:
                 # Audio was consumed by the splice. Don't also map 0:a / -af
                 # or the filler comes back on a second, uncut track.
+                # -t is the post-cut length. The source span is longer, and a
+                # looped logo fills that gap by repeating the last frame, which
+                # grew every cut render back out to the uncut duration.
                 fc_parts.append(f"[{alabel}]{af}[aout]")
-                cmd += ["-t", str(duration),
+                played = speed if speed and speed > 0 else 1.0
+                cmd += ["-t", f"{splice_expected / played:.6f}",
                         "-filter_complex", ";".join(fc_parts),
                         "-map", f"[{last}]", "-map", "[aout]"]
             else:

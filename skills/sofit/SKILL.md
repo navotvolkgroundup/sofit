@@ -117,6 +117,8 @@ Present the table; ask which numbers to render. Then build the spec from the pic
   `--defiller-discourse` also cuts opt-in words such as כאילו (off by default —
   כאילו is often a real word); `SOFIT_DISCOURSE_FILLERS` adds more. The crossfade
   is aligned to whole frames, so a 25fps render does not stop at the join.
+  The encode length is the post-cut duration: a looped logo was holding the
+  last frame out to the uncut span.
   The MCP `render_clips` tool takes `defiller`, `defiller_dry_run`,
   `defiller_min_gap`, `defiller_discourse`, `defiller_elongation`, and
   `defiller_skip`.
