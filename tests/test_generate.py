@@ -431,3 +431,27 @@ def test_clip_spec_emits_segments_only_for_multi_beat_edits():
         segs, segs[-1].end)
     spec1 = gen.clip_spec(q1, segs, "clip-2")
     assert "segments" not in spec1 and spec1["words"]
+
+
+def test_prompts_follow_episode_language(monkeypatch):
+    # Every generator routes through call_claude_json, so SOFIT_LANG (set by
+    # --lang) must reach the chapter and show-notes prompts alike.
+    seen = []
+
+    def fake_cli(system, user, model):
+        seen.append(system)
+        if "show notes" in system:
+            return json.dumps({"summary": "s", "bullets": []})
+        return json.dumps([{"title": "Intro", "quote": "שלום וברוכים הבאים"}], ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_claude_cli", fake_cli)
+    monkeypatch.setenv("SOFIT_LANG", "en")
+    make_chapters(SEGMENTS, titler="claude-cli")
+    gen.make_shownotes(SEGMENTS, titler="claude-cli")
+    assert len(seen) == 2
+    assert all("English" in s and "Hebrew" not in s for s in seen)
+
+    seen.clear()
+    monkeypatch.delenv("SOFIT_LANG")
+    make_chapters(SEGMENTS, titler="claude-cli")
+    assert "Hebrew" in seen[0]  # default stays Hebrew

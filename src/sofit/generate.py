@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import languages
 from .transcribe import Segment
 
 # Titling is cheap and quality-sensitive for Hebrew; tune this to taste.
@@ -263,6 +264,9 @@ def call_claude_json(system: str, user: str, validate, model: str | None = None,
     Raises GenerationError after the retry is exhausted.
     """
     model = model or os.environ.get("SOFIT_TITLER_MODEL") or CLAUDE_MODEL
+    # Prompts are written for Hebrew; SOFIT_LANG (set by --lang) swaps in the
+    # episode language at the one place every generator routes through.
+    system = system.replace("Hebrew", languages.name(os.environ.get("SOFIT_LANG", languages.DEFAULT_LANG)))
     transport = _call_claude_cli if titler == "claude-cli" else _call_api
     last_err: Exception | None = None
     for _ in range(2):
