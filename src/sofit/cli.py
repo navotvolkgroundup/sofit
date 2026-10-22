@@ -114,6 +114,16 @@ def _parser() -> argparse.ArgumentParser:
                    help="also cut opt-in discourse fillers such as כאילו "
                         "(off by default: כאילו is often a real word). "
                         "SOFIT_DISCOURSE_FILLERS appends more, comma-separated")
+    p.add_argument("--defiller-elongation", action="store_true",
+                   help="also cut a hum that is the drawn-out tail of a word "
+                        "(מה…, לא…). Off by default: those tighten comic timing "
+                        "and the dry run reports them as 'elongation'")
+    p.add_argument("--defiller-skip", default=None, metavar="TIMES",
+                   help="leave these cuts in. A comma-separated list of source "
+                        "times, or a file with one time per line (# comments "
+                        "ok). Each time is an id= from --defiller-dry-run "
+                        "(15:02.58), h:mm:ss.ss, or raw seconds, and matches "
+                        "when it falls inside that sound")
     p.add_argument("--hook-style", choices=["flash", "persistent"], default="flash",
                    help="hook card style: flash = big title, first ~1.8s only "
                    "(default); persistent = smaller boxed quote that stays up "
@@ -170,16 +180,20 @@ def _parse_char_refs(pairs: list[str] | None) -> dict[str, str]:
     return refs
 
 
-def _defiller_cfg(min_gap: float | None, discourse: bool = False):
-    from .defiller import config_from_env
-    return config_from_env(min_gap, discourse=discourse)
+def _defiller_cfg(min_gap: float | None, discourse: bool = False,
+                  elongation: bool = False, skip: str | None = None):
+    from .defiller import config_from_env, load_skip_arg
+    return config_from_env(min_gap, discourse=discourse, elongation=elongation,
+                           skip=load_skip_arg(skip))
 
 
 def _print_defiller_report(clips: list[dict], min_gap: float | None,
                            disabled: bool, media: str | None = None,
-                           discourse: bool = False) -> None:
+                           discourse: bool = False, elongation: bool = False,
+                           skip: str | None = None) -> None:
     from .defiller import format_report
-    print(format_report(clips, _defiller_cfg(min_gap, discourse), media=media))
+    print(format_report(
+        clips, _defiller_cfg(min_gap, discourse, elongation, skip), media=media))
     if disabled:
         print("(--no-defiller is set; a render would not cut these)", file=sys.stderr)
 
@@ -196,7 +210,9 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
                  cutaways: bool = False,
                  defiller: bool = True, defiller_dry_run: bool = False,
                  defiller_min_gap: float | None = None,
-                 defiller_discourse: bool = False) -> int:
+                 defiller_discourse: bool = False,
+                 defiller_elongation: bool = False,
+                 defiller_skip: str | None = None) -> int:
     """Render clips from a saved (possibly corrected) clips.json, no transcription.
     Output goes to `out_dir` if given, else the clips.json's own folder."""
     import json
@@ -226,7 +242,8 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
         return 1
     if defiller_dry_run:
         _print_defiller_report(clips, defiller_min_gap, disabled=not defiller,
-                               media=video, discourse=defiller_discourse)
+                               media=video, discourse=defiller_discourse,
+                               elongation=defiller_elongation, skip=defiller_skip)
         return 0
     if not video or not os.path.exists(video):
         print(f"error: source video not found: {video}", file=sys.stderr)
@@ -271,8 +288,9 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
                                safe_area=safe_area,
                                cover=cover, cta=cta, music=music,
                                defiller=defiller,
-                               defiller_cfg=_defiller_cfg(defiller_min_gap,
-                                                          defiller_discourse))
+                               defiller_cfg=_defiller_cfg(
+                                   defiller_min_gap, defiller_discourse,
+                                   defiller_elongation, defiller_skip))
     print(f"rendered {len(outs)} clip(s) to {out}", file=sys.stderr)
     return 0
 
@@ -343,7 +361,9 @@ def main(argv: list[str] | None = None) -> int:
                             defiller=not args.no_defiller,
                             defiller_dry_run=args.defiller_dry_run,
                             defiller_min_gap=args.defiller_min_gap,
-                            defiller_discourse=args.defiller_discourse)
+                            defiller_discourse=args.defiller_discourse,
+                            defiller_elongation=args.defiller_elongation,
+                            defiller_skip=args.defiller_skip)
 
     if args.storyboard:
         print("error: --storyboard renders from a saved spec; run once to get a "
@@ -513,7 +533,9 @@ def main(argv: list[str] | None = None) -> int:
                 _print_defiller_report(clips, args.defiller_min_gap,
                                        disabled=args.no_defiller,
                                        media=media_path,
-                                       discourse=args.defiller_discourse)
+                                       discourse=args.defiller_discourse,
+                                       elongation=args.defiller_elongation,
+                                       skip=args.defiller_skip)
             elif args.render_clips:
                 try:
                     from . import render
@@ -529,7 +551,9 @@ def main(argv: list[str] | None = None) -> int:
                                                defiller=not args.no_defiller,
                                                defiller_cfg=_defiller_cfg(
                                                    args.defiller_min_gap,
-                                                   args.defiller_discourse))
+                                                   args.defiller_discourse,
+                                                   args.defiller_elongation,
+                                                   args.defiller_skip))
                     print(f"rendered {len(outs)} clips to {args.render_clips}", file=sys.stderr)
                 except ImportError:
                     print("error: --render-clips needs the render extra: pip install 'sofit-cli[render]'", file=sys.stderr)

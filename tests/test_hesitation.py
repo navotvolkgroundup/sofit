@@ -240,6 +240,39 @@ def _write_wav(path, samples, sr):
         handle.writeframes(frames)
 
 
+def test_hum_on_a_word_ending_is_an_elongation_unless_opted_in():
+    # The hum starts where "מה" ends: the drawn-out tail, not a separate um.
+    # A hum a quarter-second later is still a hesitation and is cut.
+    dur = 2.4
+    words = [
+        {"t": 0.00, "d": 0.30, "w": "מה"},
+        {"t": 1.80, "d": 0.40, "w": "עולם"},
+    ]
+    tail = _buf(dur)
+    _put(tail, 0.30, _sine(SR, 0.40, 200))
+    plan = _plan(tail, words, dur)
+    elong = [h for h in plan.hits if h.source == "audio"]
+    assert elong and all(h.text == "elongation" and not h.applied for h in elong
+                         if h.reason == "elongation" or h.text == "elongation")
+    marked = [h for h in plan.hits if h.text == "elongation"]
+    assert len(marked) == 1 and marked[0].applied is False
+    assert marked[0].reason == "elongation"
+    assert plan.cuts == []
+
+    later = _buf(dur)
+    _put(later, 0.55, _sine(SR, 0.40, 200))
+    plan = _plan(later, words, dur)
+    hums = [h for h in plan.applied_hits if h.source == "audio"]
+    assert len(hums) == 1 and hums[0].text == "אמ"
+    assert not any(h.text == "elongation" for h in plan.hits)
+
+    opted = plan_defill(words, dur, DefillerConfig(elongation=True),
+                        pcm=tail, sample_rate=SR)
+    applied = [h for h in opted.applied_hits if h.source == "audio"]
+    assert len(applied) == 1 and applied[0].text == "elongation"
+    assert applied[0].reason == "elongation"
+
+
 def test_min_gap_still_guards_an_audio_cut():
     # A 0.20s word between two hums. Cutting both would flash it.
     dur = 3.0

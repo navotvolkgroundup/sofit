@@ -221,6 +221,69 @@ def test_discourse_flag_is_opt_in(monkeypatch, tmp_path, capsys):
                for ln in out.splitlines())
 
 
+def test_skip_flag_and_file_veto_one_cut(monkeypatch, tmp_path, capsys):
+    p = _filler_doc(tmp_path)
+    _no_transcribe(monkeypatch)
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run",
+                   "--defiller-skip", "12.50"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "id=0:12.50" in out
+    assert any(ln.strip().startswith("keep") and "אממ" in ln.split()
+               for ln in out.splitlines())
+    assert not any(ln.strip().startswith("cut") and "אממ" in ln.split()
+                   for ln in out.splitlines())
+
+    ids = tmp_path / "skip.txt"
+    ids.write_text("# from the dry run\n0:12.50\n", encoding="utf-8")
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run",
+                   "--defiller-skip", str(ids)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert any(ln.strip().startswith("keep") and "אממ" in ln.split()
+               for ln in out.splitlines())
+
+
+def test_elongation_flag_is_opt_in(monkeypatch, tmp_path, capsys):
+    import math
+    import struct
+    import wave
+    sr = 8000
+    dur = 2.4
+    samples = [0.0] * int(sr * dur)
+    hum = [0.45 * math.sin(2 * math.pi * 200 * i / sr) for i in range(int(sr * 0.40))]
+    at = int(0.30 * sr)  # flush with the end of "מה"
+    samples[at:at + len(hum)] = hum
+    media = tmp_path / "ep.wav"
+    with wave.open(str(media), "w") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sr)
+        handle.writeframes(b"".join(
+            struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767)) for s in samples))
+    doc = {"schema_version": 1, "source": {"video": str(media)}, "clips": [{
+        "id": "clip-1", "start": 0.0, "end": dur,
+        "words": [
+            {"t": 0.00, "d": 0.30, "w": "מה"},
+            {"t": 1.80, "d": 0.40, "w": "עולם"},
+        ],
+    }]}
+    p = tmp_path / "clips.json"
+    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    _no_transcribe(monkeypatch)
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert any(ln.strip().startswith("keep") and "elongation" in ln.split()
+               for ln in out.splitlines()), out
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run",
+                   "--defiller-elongation"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert any(ln.strip().startswith("cut") and "elongation" in ln.split()
+               for ln in out.splitlines()), out
+
+
 def test_no_defiller_flag_reaches_render(monkeypatch, tmp_path):
     p = _filler_doc(tmp_path)
     _no_transcribe(monkeypatch)
