@@ -699,6 +699,107 @@ def test_splice_filter_forces_fps_on_50fps_and_vfr(tmp_path, monkeypatch):
     assert constant_fps_for_xfade(src) == "25"
 
 
+def test_splice_clock_puts_a_25fps_crossfade_on_whole_frames():
+    """0.02s at 25fps is half a frame. The dissolve has to be one frame,
+    and the offset has to land on a frame, or xfade ends the picture."""
+    from sofit.defiller import splice_layout
+    from sofit.render import _splice_av_filters, _splice_clock
+
+    layout, _out, xf = splice_layout([(0.0, 8.36), (8.48, 12.0)], 0.02)
+    pieces, fade, expected = _splice_clock(layout, xf, "25")
+    assert fade == pytest.approx(0.04)
+    # 8.36s is 209 frames. The second piece (3.52s) is 88. One-frame overlap.
+    assert pieces[0] == pytest.approx((0.0, 8.36, 0.0))
+    assert pieces[1][2] == pytest.approx(8.32)
+    assert expected == pytest.approx((209 + 88 - 1) / 25)
+    graph = ";".join(_splice_av_filters(layout, xf, 12.0, fps="25")[0])
+    assert "duration=0.040000" in graph
+    assert "offset=8.320000" in graph
+    assert "acrossfade=d=0.040000" in graph
+    assert graph.count("fps=25") == 2
+
+    # A later join is measured on the already-shortened output. Forgetting
+    # the earlier dissolves puts the offset one frame past the picture.
+    many, _out, xf = splice_layout(
+        [(0.0, 4.0), (4.12, 4.40), (4.55, 8.36), (8.48, 12.0)], 0.02)
+    pieces, fade, _expected = _splice_clock(many, xf, "25")
+    assert fade == pytest.approx(0.04)
+    assert [round(p[2], 2) for p in pieces] == [0.0, 3.96, 4.20, 7.96]
+
+    # A piece of a single frame cannot hold a one-frame dissolve.
+    short, _out, xf = splice_layout([(0.0, 0.04), (0.20, 1.0)], 0.02)
+    graph = ";".join(_splice_av_filters(short, xf, 1.0, fps="25")[0])
+    assert "xfade=" not in graph
+    assert "concat=n=2" in graph
+
+
+def test_duration_assertion_names_a_short_video():
+    from sofit.render import _duration_mismatch
+    # The field failure: video dies at the join, audio and the container run on.
+    message = _duration_mismatch(8.360, 11.860, 11.840, container=11.860)
+    assert message is not None
+    assert "video 8.360s" in message
+    assert "expected 11.840s" in message
+    # Both streams on the frame clock, audio a few tens of ms long (AAC priming).
+    assert _duration_mismatch(11.840, 11.880, 11.840, container=11.880) is None
+    assert _duration_mismatch(None, 11.840, 11.840) is not None
+
+
+def test_splice_at_25fps_keeps_video_through_several_cuts(tmp_path, monkeypatch):
+    """Several joins, including a 0.12s cut, a second cut just after it, and
+    a late cut whose first piece is a whole number of 25fps frames.
+
+    That last shape is the one that truncated real Weekly Sync renders: the
+    video stopped at the join while the audio continued. Both streams have
+    to match the frame clock, and extract_clip checks that itself.
+    """
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg")
+    from sofit.defiller import splice_layout
+    from sofit.render import (
+        _assert_rendered_duration,
+        _run_ffmpeg,
+        _splice_av_filters,
+        _splice_clock,
+        extract_clip,
+    )
+
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+         "testsrc=size=320x240:rate=50:duration=12",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+         "-shortest", "-c:v", "libx264", "-preset", "ultrafast",
+         "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
+         "-c:a", "aac", "-y", str(src)],
+        check=True,
+    )
+    drops = [(4.00, 4.12), (4.40, 4.55), (8.36, 8.48)]
+    from sofit.defiller import keep_intervals
+    keeps = keep_intervals(12.0, drops)
+    layout, _out, xf = splice_layout(keeps, 0.02)
+    _pieces, _fade, expected = _splice_clock(layout, xf, "25")
+    parts, vlabel, alabel = _splice_av_filters(layout, xf, 12.0, fps="25")
+    out = tmp_path / "joined.mp4"
+    _run_ffmpeg([
+        "ffmpeg", "-i", str(src), "-filter_complex", ";".join(parts),
+        "-map", f"[{vlabel}]", "-map", f"[{alabel}]",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-y", str(out),
+    ])
+    _assert_rendered_duration(out, expected)
+
+    monkeypatch.setenv("SOFIT_FPS", "25")
+    delivered = tmp_path / "clip.mp4"
+    extract_clip(
+        src, 0.0, 12.0, delivered, drops=drops, drop_crossfade=0.02,
+        crop_vf="scale=160:160,setsar=1",
+    )
+    _assert_rendered_duration(delivered, expected)
+
+
 def test_splice_filter_crossfades_audio_and_video():
     from sofit.defiller import splice_layout
     from sofit.render import _splice_av_filters

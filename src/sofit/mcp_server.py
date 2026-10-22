@@ -115,7 +115,9 @@ def render_clips(path: str, out_dir: str, aspect: str = "9:16", model: str = "",
                  hook_card: bool = True, hook_variant: int = 0,
                  defiller: bool = True, defiller_dry_run: bool = False,
                  defiller_min_gap: float = 0.40,
-                 defiller_discourse: bool = False) -> dict:
+                 defiller_discourse: bool = False,
+                 defiller_elongation: bool = False,
+                 defiller_skip: str = "") -> dict:
     """Render each pull-quote of an already-transcribed episode to a vertical
     (default 9:16) clip with burned Hebrew captions, written to out_dir. Pass
     `logo` (a transparent PNG path) to overlay it in the `logo_pos` corner of
@@ -128,9 +130,14 @@ def render_clips(path: str, out_dir: str, aspect: str = "9:16", model: str = "",
     host, and a silent pause are left in. `defiller=false` keeps everything.
     `defiller_min_gap` (seconds, default 0.40) is the minimum speech that
     must remain between two cuts. `defiller_discourse=true` also cuts opt-in
-    words such as כאילו (off by default). `defiller_dry_run` returns each
-    candidate with its source time, whether it came from the word list or
-    the audio, and a confidence, and does not render.
+    words such as כאילו (off by default). `defiller_elongation=true` also
+    cuts a hum that is the drawn-out tail of a word (reported as elongation,
+    off by default). `defiller_skip` is a comma-separated list of source
+    times, or a path to a file of them — the `id=` values from a dry run
+    (`15:02.58`), and those cuts are left in. `defiller_dry_run` returns each
+    candidate with its source time, an `id`, whether it came from the word
+    list or the audio, and a confidence, and does not render. A cut in the
+    last 0.6s of a clip is left in either way.
 
     Requires the transcript cached (call transcribe_episode first). A real
     render also needs the [render] extra and ffmpeg. Returns the output file
@@ -139,8 +146,10 @@ def render_clips(path: str, out_dir: str, aspect: str = "9:16", model: str = "",
     if segs is None:
         return {"error": "not transcribed yet — call transcribe_episode(path) first"}
     clips = generate.make_clips(segs, titler="api")
-    from .defiller import analyze_clips, config_from_env, format_spans
-    cfg = config_from_env(defiller_min_gap, discourse=defiller_discourse)
+    from .defiller import analyze_clips, config_from_env, format_spans, load_skip_arg
+    cfg = config_from_env(defiller_min_gap, discourse=defiller_discourse,
+                          elongation=defiller_elongation,
+                          skip=load_skip_arg(defiller_skip))
     if defiller_dry_run:
         spans = analyze_clips(clips, cfg, media=path)
         return {

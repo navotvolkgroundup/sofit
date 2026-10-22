@@ -21,6 +21,7 @@ Caption rendering has two paths:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -2038,6 +2039,169 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {error_msg}")
 
 
+def _fps_hz(token: str | None) -> float | None:
+    if not token or not _FPS_TOKEN.match(str(token).strip()):
+        return None
+    return _parse_rate(str(token).strip())
+
+
+def _splice_clock(layout: list, crossfade: float, fps: str | None = None
+                  ) -> tuple[list[tuple[float, float, float]], float, float]:
+    """Piece trims, crossfade length, and the output duration of a splice.
+
+    Each item is (source_start, source_end, output_offset). Without `fps`
+    those are the `splice_layout` times unchanged.
+
+    xfade stores duration and offset as microseconds, then rounds them onto
+    the output frame. A 0.02s dissolve at 25fps is half a frame. When the
+    first piece is a whole number of frames, that offset rounds to one frame
+    past the last frame of the piece: the transition never starts inside it,
+    ffmpeg treats the next piece as already finished, and the video ends at
+    the join. The audio crossfade still runs to the planned end, so the
+    container duration looks right and a later `-shortest` caption pass cuts
+    the file down to the short video.
+
+    With `fps` set, each kept piece is shortened to a whole number of frames
+    (never extended into the cut), the dissolve is at least one frame, and
+    every offset lands on a frame. A piece that cannot hold that dissolve
+    falls back to a hard join. The returned duration is that frame clock,
+    which is what a finished file is checked against.
+    """
+    rows = [(float(s), float(e), float(o)) for s, e, o in layout]
+    hz = _fps_hz(fps)
+    n = len(rows)
+    if hz is None or n == 0:
+        fade = crossfade if crossfade > 0 and n > 1 else 0.0
+        if not rows:
+            return rows, 0.0, 0.0
+        src_s, src_e, out = rows[-1]
+        return rows, fade, out + (src_e - src_s)
+
+    counts: list[tuple[float, float, int]] = []
+    for src_s, src_e, _out in rows:
+        dur = max(0.0, src_e - src_s)
+        frames = max(1, math.floor(dur * hz + 1e-6))
+        actual = frames / hz
+        # floor can still land one frame past the planned end when `dur * hz`
+        # is a hair over an integer. Pull back rather than eat the cut.
+        if actual > dur + 1e-9 and frames > 1:
+            frames -= 1
+            actual = frames / hz
+        counts.append((src_s, src_s + actual, frames))
+
+    fade_frames = 0
+    if crossfade > 0 and n > 1:
+        # Half-up, not banker's round: 0.5 of a frame becomes 1 frame.
+        fade_frames = max(1, math.floor(crossfade * hz + 0.5))
+        if any(frames <= fade_frames for _s, _e, frames in counts):
+            fade_frames = 0
+
+    pieces: list[tuple[float, float, float]] = []
+    accumulated = 0
+    for i, (src_s, src_e, frames) in enumerate(counts):
+        # Chained xfade measures offset on the output of the previous join,
+        # which is already shorter by one dissolve per earlier cut. Subtract
+        # this join's dissolve too, so the fade starts on the last frame
+        # rather than one frame after the picture has ended.
+        offset_frames = 0 if i == 0 else accumulated - fade_frames * i
+        pieces.append((src_s, src_e, offset_frames / hz))
+        accumulated += frames
+    expected = (accumulated - fade_frames * (n - 1)) / hz
+    return pieces, (fade_frames / hz), expected
+
+
+_SPLICE_DURATION_TOLERANCE = 0.10
+
+
+def _probe_av_durations(path: Path) -> tuple[float | None, float | None, float | None]:
+    """(video, audio, container) durations in seconds.
+
+    The container follows whichever stream is longer, so a video that died
+    at a join still reports a full container length. Video prefers the
+    stream duration and falls back to frame count over frame rate.
+    """
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,duration,nb_frames,r_frame_rate:format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        data = json.loads(probe.stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None, None, None
+    video = audio = None
+    for stream in data.get("streams") or []:
+        kind = stream.get("codec_type")
+        if kind == "video" and video is None:
+            video = _stream_duration(stream, video=True)
+        elif kind == "audio" and audio is None:
+            audio = _stream_duration(stream, video=False)
+    container = None
+    raw = (data.get("format") or {}).get("duration")
+    if raw not in (None, "N/A", ""):
+        try:
+            container = float(raw)
+        except (TypeError, ValueError):
+            container = None
+    return video, audio, container
+
+
+def _stream_duration(stream: dict, video: bool) -> float | None:
+    raw = stream.get("duration")
+    if raw not in (None, "N/A", ""):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    if not video:
+        return None
+    nb = stream.get("nb_frames")
+    rate = _parse_rate(str(stream.get("r_frame_rate") or ""))
+    if nb in (None, "N/A", "") or not rate:
+        return None
+    try:
+        return float(nb) / rate
+    except (TypeError, ValueError):
+        return None
+
+
+def _duration_mismatch(video: float | None, audio: float | None, expected: float,
+                       tolerance: float = _SPLICE_DURATION_TOLERANCE,
+                       container: float | None = None) -> str | None:
+    """A loud description when either stream misses `expected`, else None."""
+    problems: list[str] = []
+    if video is None:
+        problems.append("video duration unreadable")
+    elif abs(video - expected) > tolerance:
+        problems.append(f"video {video:.3f}s")
+    if audio is None:
+        problems.append("audio duration unreadable")
+    elif abs(audio - expected) > tolerance:
+        problems.append(f"audio {audio:.3f}s")
+    if not problems:
+        return None
+    box = "unreadable" if container is None else f"{container:.3f}s"
+    return (
+        f"rendered duration mismatch: expected {expected:.3f}s "
+        f"(±{tolerance:.3f}s), got {', '.join(problems)}; "
+        f"container {box}. The picture stopped early at a splice join."
+    )
+
+
+def _assert_rendered_duration(path: Path, expected: float,
+                              tolerance: float = _SPLICE_DURATION_TOLERANCE) -> None:
+    """Fail the render when the file is shorter than the splice clock.
+
+    Both streams are checked. Container duration follows the audio and hid
+    joins where the video had already ended.
+    """
+    video, audio, container = _probe_av_durations(path)
+    message = _duration_mismatch(video, audio, expected, tolerance, container)
+    if message:
+        raise RuntimeError(message)
+
+
 def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
                        v_in: str = "0:v", a_in: str = "0:a",
                        with_video: bool = True,
@@ -2057,16 +2221,19 @@ def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
     `fps`, when set, is an `fps=` filter on every video piece. trim+setpts
     strips the CFR tag and xfade errors without it; the value comes from
     `constant_fps_for_xfade` (source rate, average rate for VFR, or the
-    output override).
+    output override). The same rate quantizes the trims and the dissolve
+    onto whole frames — see `_splice_clock`.
     """
-    fps_token = fps if fps and _FPS_TOKEN.match(str(fps).strip()) else None
+    fps_token = fps if _fps_hz(fps) else None
+    pieces, fade, _expected = _splice_clock(layout, crossfade, fps_token)
+    places = 6 if fps_token else 4
     parts: list[str] = []
-    n = len(layout)
+    n = len(pieces)
     v_labels: list[str] = []
     a_labels: list[str] = []
-    for i, (src_s, src_e, _out) in enumerate(layout):
+    for i, (src_s, src_e, _out) in enumerate(pieces):
         if with_video:
-            chain = (f"[{v_in}]trim=start={src_s:.4f}:end={src_e:.4f},"
+            chain = (f"[{v_in}]trim=start={src_s:.{places}f}:end={src_e:.{places}f},"
                      f"setpts=PTS-STARTPTS")
             if fps_token:
                 chain += f",fps={fps_token}"
@@ -2075,14 +2242,14 @@ def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
             v_labels.append(f"[vk{i}]")
         dur = max(src_e - src_s, 0.0)
         fd = min(edge_fade, dur / 3.0) if dur else 0.0
-        if crossfade > 0:
+        if fade > 0:
             # Joins are crossfaded; only the outer cut edges need a fade.
             fade_in = i == 0 and src_s > 0.01
             fade_out = i == n - 1 and src_e < source_duration - 0.01
         else:
             fade_in = src_s > 0.01 if i == 0 else True
             fade_out = src_e < source_duration - 0.01 if i == n - 1 else True
-        chain = (f"[{a_in}]atrim=start={src_s:.4f}:end={src_e:.4f},"
+        chain = (f"[{a_in}]atrim=start={src_s:.{places}f}:end={src_e:.{places}f},"
                  f"asetpts=PTS-STARTPTS")
         if n > 1:
             # acrossfade/concat require matching format. Same-source trims
@@ -2100,15 +2267,15 @@ def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
         return parts, ("vk0" if with_video else None), "ak0"
 
     if with_video:
-        if crossfade > 0:
+        if fade > 0:
             prev = v_labels[0]
             v_out = "vcat"
             for i in range(1, n):
                 v_out = "vcat" if i == n - 1 else f"vx{i}"
-                off = layout[i][2]
+                off = pieces[i][2]
                 parts.append(
                     f"{prev}{v_labels[i]}xfade=transition=fade:"
-                    f"duration={crossfade:.4f}:offset={off:.4f}[{v_out}]")
+                    f"duration={fade:.{places}f}:offset={off:.{places}f}[{v_out}]")
                 prev = f"[{v_out}]"
         else:
             parts.append("".join(v_labels) + f"concat=n={n}:v=1:a=0[vcat]")
@@ -2116,13 +2283,13 @@ def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
     else:
         v_out = None
 
-    if crossfade > 0:
+    if fade > 0:
         prev = a_labels[0]
         a_out = "acat"
         for i in range(1, n):
             a_out = "acat" if i == n - 1 else f"ax{i}"
             parts.append(
-                f"{prev}{a_labels[i]}acrossfade=d={crossfade:.4f}:c1=tri:c2=tri[{a_out}]")
+                f"{prev}{a_labels[i]}acrossfade=d={fade:.{places}f}:c1=tri:c2=tri[{a_out}]")
             prev = f"[{a_out}]"
     else:
         parts.append("".join(a_labels) + f"concat=n={n}:v=0:a=1[acat]")
@@ -2188,6 +2355,9 @@ def extract_clip(
     layout = None
     out_duration = duration
     used_xf = 0.0
+    # Frame-quantized length of a video splice. None when this extract does
+    # not join pieces, so a plain trim is not held to the splice clock.
+    splice_expected: float | None = None
     if drops:
         from .defiller import keep_intervals, splice_layout
         keeps = keep_intervals(duration, [(float(a), float(b)) for a, b in drops])
@@ -2286,9 +2456,11 @@ def extract_clip(
                 # Cut the fillers BEFORE the crop, so speaker-tracking `t` and
                 # the logo (applied next, on the cropped frame) follow the
                 # shortened clock the captions were shifted onto.
+                splice_fps = constant_fps_for_xfade(source_video)
+                _pieces, _fade, splice_expected = _splice_clock(
+                    layout, used_xf, splice_fps)
                 spliced, vlabel, alabel = _splice_av_filters(
-                    layout, used_xf, duration,
-                    fps=constant_fps_for_xfade(source_video))
+                    layout, used_xf, duration, fps=splice_fps)
                 fc_parts.extend(spliced)
                 fc_parts.append(f"[{vlabel}]{vf}[base]")
             else:
@@ -2368,6 +2540,12 @@ def extract_clip(
         if _sub_symlink and _sub_symlink.exists():
             _sub_symlink.unlink()
 
+    played = speed if speed and speed > 0 else 1.0
+    if splice_expected is not None:
+        # Check the spliced picture before a caption pass. -shortest on that
+        # pass would otherwise bake a short video into the delivered file.
+        _assert_rendered_duration(temp_clip, splice_expected / played)
+
     # Step 2: Burn captions in a Pillow pass if needed
     if burn_captions:
         try:
@@ -2380,6 +2558,8 @@ def extract_clip(
         finally:
             if temp_clip.exists():
                 temp_clip.unlink()
+        if splice_expected is not None:
+            _assert_rendered_duration(output_path, splice_expected / played)
     elif burn_with_pillow:
         try:
             _burn_subtitles_pillow(temp_clip, subtitles_path, output_path, tw, th,
@@ -2387,6 +2567,8 @@ def extract_clip(
         finally:
             if temp_clip.exists():
                 temp_clip.unlink()
+        if splice_expected is not None:
+            _assert_rendered_duration(output_path, splice_expected / played)
 
     return output_path
 
@@ -2608,7 +2790,7 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                     if pcm is None:
                         print(f"defiller: {clip_id} span {ri} audio scan failed; "
                               "word fillers only", file=sys.stderr)
-            plan = (plan_defill(raw_words, span_dur, cfg, pcm=pcm)
+            plan = (plan_defill(raw_words, span_dur, cfg, pcm=pcm, origin=start)
                     if defiller and raw_words else None)
             cap_words = raw_words
             drops = None

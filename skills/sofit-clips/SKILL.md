@@ -110,14 +110,19 @@ Present the table; ask which numbers to render. Build the spec from the picks:
   kept piece is forced to a constant frame rate before the crossfade (the
   source rate, the average rate when the file is variable-frame-rate, or
   `SOFIT_FPS` when that override is set) so xfade does not reject 50fps
-  footage.
+  footage. The dissolve itself is a whole number of those frames — a 0.02s
+  fade at 25fps is half a frame and was ending the picture at the join.
   `--no-defiller` keeps every hesitation. `--defiller-dry-run` prints each
-  candidate with its source timestamp, `word` or `audio`, and a confidence,
-  and does not render. `--defiller-min-gap 0.40` (the default) skips a cut
-  that would leave less than 0.40s of speech between two cuts.
-  `--defiller-discourse` also cuts כאילו and the rest of the opt-in list
-  (off by default; כאילו is often a real word). Extra tokens:
-  `SOFIT_FILLERS` / `SOFIT_SHORT_FILLERS` / `SOFIT_DISCOURSE_FILLERS`.
+  candidate with its source timestamp, `id=m:ss.ss`, `word` or `audio`, and
+  a confidence, and does not render. `--defiller-min-gap 0.40` (the default)
+  skips a cut that would leave less than 0.40s of speech between two cuts.
+  A cut in the last 0.6s of the clip is left in. A hum glued to the end of
+  the previous word is reported as `elongation` and left in unless
+  `--defiller-elongation` is set. `--defiller-skip 15:02.58,15:21.24`, or a
+  file of those ids, vetoes the listed cuts. `--defiller-discourse` also cuts
+  כאילו and the rest of the opt-in list (off by default; כאילו is often a
+  real word). Extra tokens: `SOFIT_FILLERS` / `SOFIT_SHORT_FILLERS` /
+  `SOFIT_DISCOURSE_FILLERS`.
   The pass runs on the footage render. `--storyboard` is not defilled.
 - Output `<out_dir>/clip-N.mp4` (ids match the pool numbers). Copy to ~/Downloads as `WS<episode>_clip-N.mp4`.
 - Per-frame Pillow caption pass ⇒ seconds+ per clip; run in background.

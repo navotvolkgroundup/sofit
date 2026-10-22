@@ -316,6 +316,72 @@ def test_discourse_fillers_are_off_unless_opted_in(monkeypatch):
     assert "כאילו" not in _texts(plan_defill(words, dur, env_cfg))
 
 
+def test_end_guard_keeps_a_cut_that_reaches_the_punchline():
+    # 53.06s into a 53.9s clip: the padded cut runs into the last 0.6s and
+    # would take the punchline word with it. An earlier filler still goes.
+    words, dur = _span(
+        (1.00, 0.40, "פתיחה"),
+        (2.00, 0.30, "אממ"),
+        (3.00, 4.00, "המשך"),
+        (53.06, 0.40, "אממ"),
+        (53.55, 0.30, "פאנץ"),
+        dur=53.9,
+    )
+    plan = plan_defill(words, dur)
+    assert "פאנץ" in _texts(plan)
+    late = next(h for h in plan.hits if h.start == pytest.approx(53.06))
+    assert late.applied is False and late.reason == "end_guard"
+    early = next(h for h in plan.hits if h.start == pytest.approx(2.00))
+    assert early.applied is True
+    assert all(c[1] <= 53.9 - 0.60 + 1e-3 for c in plan.cuts)
+
+
+def test_skip_list_matches_clock_ids_raw_seconds_and_a_file(tmp_path):
+    from sofit.defiller import format_clock, load_skip_arg, parse_clock
+    words, dur = _span(
+        (0.00, 0.40, "שלום"),
+        (2.58, 0.30, "אממ"),
+        (4.00, 1.00, "אמצע"),
+        (21.24, 0.30, "אממ"),
+        (23.00, 1.00, "סוף"),
+        dur=25.0,
+    )
+    origin = 900.0  # 15:00.00, so the first filler is 15:02.58
+    assert format_clock(902.58) == "15:02.58"
+    assert parse_clock("15:02.58") == pytest.approx(902.58)
+    assert parse_clock("1:00:02.58") == pytest.approx(3602.58)
+    assert parse_clock("902.58") == pytest.approx(902.58)
+
+    cfg = DefillerConfig(skip=("15:02.58",))
+    plan = plan_defill(words, dur, cfg, origin=origin)
+    kept = next(h for h in plan.hits if h.start == pytest.approx(2.58))
+    cut = next(h for h in plan.hits if h.start == pytest.approx(21.24))
+    assert kept.applied is False and kept.reason == "skip"
+    assert cut.applied is True
+
+    # The id printed by the dry run is what a person pastes back.
+    report = format_report([{
+        "id": "clip-1", "start": origin, "end": origin + dur, "words": words,
+    }], cfg)
+    line = next(ln for ln in report.splitlines()
+                if ln.strip().startswith("keep") and "אממ" in ln.split())
+    assert "id=15:02.58" in line
+    assert float(line.split()[1]) == pytest.approx(902.58)
+    assert float(line.split()[3]) == pytest.approx(902.88, abs=0.01)
+
+    listed = load_skip_arg("15:02.58,921.24")
+    both = plan_defill(words, dur, DefillerConfig(skip=listed), origin=origin)
+    assert both.cuts == []
+
+    path = tmp_path / "skip.txt"
+    path.write_text("# veto from the dry run\n15:02.58\n15:21.24, 0:01.00\n",
+                    encoding="utf-8")
+    from_file = load_skip_arg(str(path))
+    assert from_file == ("15:02.58", "15:21.24", "0:01.00")
+    skipped = plan_defill(words, dur, DefillerConfig(skip=from_file), origin=origin)
+    assert skipped.cuts == []
+
+
 def test_missing_media_keeps_the_word_report_and_says_why():
     clip = {"id": "clip-9", "start": 0.0, "end": 2.0, "words": [
         {"t": 0.0, "d": 0.4, "w": "שלום"},
