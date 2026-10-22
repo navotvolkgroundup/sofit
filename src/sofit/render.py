@@ -33,6 +33,14 @@ try:  # optional; captions still render (in logical order) without it
 except Exception:  # pragma: no cover - depends on env
     _bidi_display = None
 
+from .defiller import (
+    DefillerConfig,
+    plan_defill,
+    remap_face_samples,
+    shift_point,
+    shift_window,
+)
+
 
 # ---------------------------------------------------------------------------
 # ffmpeg capability probe
@@ -1835,7 +1843,10 @@ def _audiogram_cmd(source_video: Path, padded_start: float, duration: float,
                    logo: str | None, logo_pos: str, safe_area: str,
                    speed: float, af: str, temp_clip: Path,
                    card_fade_at: float | None = None,
-                   music: str | None = None) -> tuple[list[str], int]:
+                   music: str | None = None,
+                   source_duration: float | None = None,
+                   audio_layout: list | None = None,
+                   audio_crossfade: float = 0.0) -> tuple[list[str], int]:
     """ffmpeg command for an audio-only source: blurred cover background with a
     slow push-in, optional rounded art card, and a subtle waveform strip (the
     captions burned by the later Pillow pass are the hero element — research
@@ -1847,15 +1858,24 @@ def _audiogram_cmd(source_video: Path, padded_start: float, duration: float,
     Returns (cmd, hook_top_min)."""
     fps = 30
     frames = max(1, round(duration * fps))
-    cmd = ["ffmpeg", "-ss", str(padded_start), "-t", str(duration),
+    # `duration` is the OUTPUT length (after filler cuts). The input read has
+    # to cover the original span, or a cut in the middle would be past EOF.
+    read_for = duration if source_duration is None else source_duration
+    cmd = ["ffmpeg", "-ss", str(padded_start), "-t", str(read_for),
            "-i", str(source_video), "-loop", "1", "-i", bg_png]
     # Slow 10% push-in over the clip; the pre-blurred background hides
     # zoompan's integer-rounding jitter.
-    fc = [
-        "[0:a]asplit=2[a_wv][a_raw]",
+    fc: list[str] = []
+    if audio_layout:
+        spliced, _vlabel, alabel = _splice_av_filters(
+            audio_layout, audio_crossfade, read_for, with_video=False)
+        fc.extend(spliced)
+        fc.append(f"[{alabel}]asplit=2[a_wv][a_raw]")
+    else:
+        fc.append("[0:a]asplit=2[a_wv][a_raw]")
+    fc.append(
         f"[1:v]zoompan=z='1+0.10*on/{frames}':x='(iw-iw/zoom)/2'"
-        f":y='(ih-ih/zoom)/2':d=1:s={tw}x{th}:fps={fps}[bg]",
-    ]
+        f":y='(ih-ih/zoom)/2':d=1:s={tw}x{th}:fps={fps}[bg]")
     last = "bg"
     idx = 2
     if art_png:
@@ -1937,6 +1957,88 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {error_msg}")
 
 
+def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
+                       v_in: str = "0:v", a_in: str = "0:a",
+                       with_video: bool = True,
+                       edge_fade: float = 0.015) -> tuple[list[str], str | None, str]:
+    """Trim kept pieces and join them.
+
+    `layout` is (source_start, source_end, output_start) from
+    `defiller.splice_layout`. With a crossfade, video uses `xfade` and audio
+    `acrossfade` for the same overlap, so the shortened picture and the
+    soundtrack stay the same length (captions are timed on that clock).
+
+    A single piece (a filler trimmed off the head or the tail) just trims,
+    with a short fade on the cut edge so the join into silence doesn't click.
+    Pieces too short to overlap fall back to a hard concat plus edge fades.
+    """
+    parts: list[str] = []
+    n = len(layout)
+    v_labels: list[str] = []
+    a_labels: list[str] = []
+    for i, (src_s, src_e, _out) in enumerate(layout):
+        if with_video:
+            parts.append(
+                f"[{v_in}]trim=start={src_s:.4f}:end={src_e:.4f},"
+                f"setpts=PTS-STARTPTS[vk{i}]")
+            v_labels.append(f"[vk{i}]")
+        dur = max(src_e - src_s, 0.0)
+        fd = min(edge_fade, dur / 3.0) if dur else 0.0
+        if crossfade > 0:
+            # Joins are crossfaded; only the outer cut edges need a fade.
+            fade_in = i == 0 and src_s > 0.01
+            fade_out = i == n - 1 and src_e < source_duration - 0.01
+        else:
+            fade_in = src_s > 0.01 if i == 0 else True
+            fade_out = src_e < source_duration - 0.01 if i == n - 1 else True
+        chain = (f"[{a_in}]atrim=start={src_s:.4f}:end={src_e:.4f},"
+                 f"asetpts=PTS-STARTPTS")
+        if n > 1:
+            # acrossfade/concat require matching format. Same-source trims
+            # usually match; pin it so a mid-stream channel change can't fail.
+            chain += ",aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+        if fd >= 0.005 and fade_in:
+            chain += f",afade=t=in:st=0:d={fd:.4f}"
+        if fd >= 0.005 and fade_out:
+            chain += f",afade=t=out:st={max(0.0, dur - fd):.4f}:d={fd:.4f}"
+        chain += f"[ak{i}]"
+        parts.append(chain)
+        a_labels.append(f"[ak{i}]")
+
+    if n == 1:
+        return parts, ("vk0" if with_video else None), "ak0"
+
+    if with_video:
+        if crossfade > 0:
+            prev = v_labels[0]
+            v_out = "vcat"
+            for i in range(1, n):
+                v_out = "vcat" if i == n - 1 else f"vx{i}"
+                off = layout[i][2]
+                parts.append(
+                    f"{prev}{v_labels[i]}xfade=transition=fade:"
+                    f"duration={crossfade:.4f}:offset={off:.4f}[{v_out}]")
+                prev = f"[{v_out}]"
+        else:
+            parts.append("".join(v_labels) + f"concat=n={n}:v=1:a=0[vcat]")
+            v_out = "vcat"
+    else:
+        v_out = None
+
+    if crossfade > 0:
+        prev = a_labels[0]
+        a_out = "acat"
+        for i in range(1, n):
+            a_out = "acat" if i == n - 1 else f"ax{i}"
+            parts.append(
+                f"{prev}{a_labels[i]}acrossfade=d={crossfade:.4f}:c1=tri:c2=tri[{a_out}]")
+            prev = f"[{a_out}]"
+    else:
+        parts.append("".join(a_labels) + f"concat=n={n}:v=0:a=1[acat]")
+        a_out = "acat"
+    return parts, v_out, a_out
+
+
 def extract_clip(
     source_video: Path,
     start_time: float,
@@ -1965,6 +2067,8 @@ def extract_clip(
     brand_pops: list[dict] | None = None,
     zoom: float = 1.0,
     audio_edge_fade: bool = False,
+    drops: list | None = None,
+    drop_crossfade: float = 0.02,
 ) -> Path:
     """Extract a clip, crop-to-fill the target aspect, and burn captions.
 
@@ -1981,10 +2085,32 @@ def extract_clip(
 
     pad_seconds defaults to 0: caption timestamps are relative to `start_time`,
     so any pre-roll pad would desync them.
+
+    `drops` are filler intervals relative to `start_time` (0 = the first frame
+    of this span). They are cut out, with `drop_crossfade` seconds of overlap
+    at each join, before the crop / logo / captions. Caption times must already
+    be on that shortened clock.
     """
     padded_start = max(0, start_time - pad_seconds)
     padded_end = end_time + pad_seconds
     duration = padded_end - padded_start
+    layout = None
+    out_duration = duration
+    used_xf = 0.0
+    if drops:
+        from .defiller import keep_intervals, splice_layout
+        keeps = keep_intervals(duration, [(float(a), float(b)) for a, b in drops])
+        layout, out_duration, used_xf = splice_layout(keeps, drop_crossfade)
+        # A plan that doesn't actually shorten the span is not a splice.
+        full_span = (
+            len(layout) == 1
+            and layout[0][0] <= 1e-3
+            and abs(layout[0][1] - duration) <= 1e-3
+        )
+        if not layout or full_span:
+            layout = None
+            out_duration = duration
+            used_xf = 0.0
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2029,7 +2155,9 @@ def extract_clip(
         af = _AUDIO_LIMITER
     if audio_edge_fade:
         # 30ms fades kill the click at narrative-cut joins; inaudible as a fade.
-        fade_out_at = max(0.0, duration / (speed or 1.0) - 0.035)
+        # Filler splices have already shortened the span, so the fade sits at
+        # the end of the OUTPUT, not the pre-cut duration.
+        fade_out_at = max(0.0, out_duration / (speed or 1.0) - 0.035)
         af += f",afade=t=in:d=0.03,afade=t=out:st={fade_out_at:.3f}:d=0.03"
 
     # Step 1: Extract and scale/crop the clip
@@ -2045,11 +2173,14 @@ def extract_clip(
         # ponytail: music bed is audiogram-only; wire it into the video path
         # when a video show asks for it.
         cmd, hook_top_min = _audiogram_cmd(
-            source_video, padded_start, duration, tw, th,
+            source_video, padded_start, out_duration, tw, th,
             audiogram[0], audiogram[1], logo, logo_pos, safe_area,
             speed, af, temp_clip,
             card_fade_at=(1.8 if hook and hook.strip() else None),
-            music=music)
+            music=music,
+            source_duration=duration if layout else None,
+            audio_layout=layout,
+            audio_crossfade=used_xf)
     else:
         cmd = ["ffmpeg", "-ss", str(padded_start), "-i", str(source_video)]
         # Cutaways: short generated scenes spliced over the footage while the
@@ -2058,8 +2189,19 @@ def extract_clip(
         # ponytail: assumes speed==1.0 (cutaway windows aren't setpts-scaled);
         # scale the times if a sped-up show ever uses cutaways.
         cw = [c for c in (cutaways or []) if os.path.exists(c["image"])]
-        if (logo and os.path.exists(logo)) or cw:
-            fc_parts = [f"[0:v]{vf}[base]"]
+        if layout or (logo and os.path.exists(logo)) or cw:
+            fc_parts: list[str] = []
+            if layout:
+                # Cut the fillers BEFORE the crop, so speaker-tracking `t` and
+                # the logo (applied next, on the cropped frame) follow the
+                # shortened clock the captions were shifted onto.
+                spliced, vlabel, alabel = _splice_av_filters(
+                    layout, used_xf, duration)
+                fc_parts.extend(spliced)
+                fc_parts.append(f"[{vlabel}]{vf}[base]")
+            else:
+                fc_parts.append(f"[0:v]{vf}[base]")
+                alabel = None
             last, idx = "base", 1
             for k, c in enumerate(cw):
                 t0, t1 = float(c["start"]), float(c["end"])
@@ -2098,12 +2240,20 @@ def extract_clip(
                 fc_parts.append(f"[{idx}:v]scale={lw}:-1[lg]")
                 fc_parts.append(f"[{last}][lg]overlay={pos}:format=auto[vout]")
                 last = "vout"
-            cmd += ["-t", str(duration),
-                    "-filter_complex", ";".join(fc_parts),
-                    "-map", f"[{last}]", "-map", "0:a?"]
+            if layout:
+                # Audio was consumed by the splice. Don't also map 0:a / -af
+                # or the filler comes back on a second, uncut track.
+                fc_parts.append(f"[{alabel}]{af}[aout]")
+                cmd += ["-t", str(duration),
+                        "-filter_complex", ";".join(fc_parts),
+                        "-map", f"[{last}]", "-map", "[aout]"]
+            else:
+                cmd += ["-t", str(duration),
+                        "-filter_complex", ";".join(fc_parts),
+                        "-map", f"[{last}]", "-map", "0:a?"]
         else:
             cmd += ["-t", str(duration), "-vf", vf]
-        if af:
+        if af and not layout:
             cmd += ["-af", af]
         _fps = _output_fps()
         if _fps:
@@ -2133,7 +2283,7 @@ def extract_clip(
                                   font=font, speed=speed, hook=hook,
                                   hook_style=hook_style, speaker_tags=speaker_tags,
                                   safe_area=safe_area, hook_top_min=hook_top_min,
-                                  accent=accent, cta=cta, clip_dur=duration,
+                                  accent=accent, cta=cta, clip_dur=out_duration,
                                   face_band=face_band, brand_pops=brand_pops)
         finally:
             if temp_clip.exists():
@@ -2224,6 +2374,34 @@ def _concat_parts(parts: list[Path], output_path: Path) -> None:
             p.unlink(missing_ok=True)
 
 
+def _defill_cutaways(items: list[dict], plan) -> list[dict]:
+    """Shift cutaway windows onto the post-filler timeline. Drop one the cut ate."""
+    if not plan or not plan.cuts:
+        return items
+    out = []
+    for c in items:
+        window = shift_window(float(c.get("start", 0.0)), float(c.get("end", 0.0)),
+                               plan.layout)
+        if window is None:
+            continue
+        n = dict(c)
+        n["start"], n["end"] = round(window[0], 3), round(window[1], 3)
+        out.append(n)
+    return out
+
+
+def _defill_at(items: list[dict], plan) -> list[dict]:
+    """Shift speaker-tag / brand-pop `at` times. Copies; the spec stays put."""
+    if not plan or not plan.cuts:
+        return items
+    out = []
+    for item in items:
+        n = dict(item)
+        n["at"] = round(shift_point(float(item.get("at", 0.0)), plan.layout), 3)
+        out.append(n)
+    return out
+
+
 def render_clips(video_path: str, clips: list[dict], out_dir: str,
                  aspect: str = "9:16", subtitles: bool = True,
                  speed: float = 1.0, font: str | None = None,
@@ -2231,7 +2409,9 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                  hook_card: bool = True, hook_variant: int = 0,
                  hook_style: str = "flash",
                  safe_area: str = "none", cover: str | None = None,
-                 cta: str | None = None, music: str | None = None) -> list[str]:
+                 cta: str | None = None, music: str | None = None,
+                 defiller: bool = True,
+                 defiller_cfg: DefillerConfig | None = None) -> list[str]:
     """Render each clip to out_dir/<id>.mp4, cropped-to-fill `aspect` with
     burned Hebrew captions from the clip's word timings. If `logo` is given, it's
     trimmed once and overlaid in the `logo_pos` corner of every clip. When
@@ -2247,6 +2427,10 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
     subtle waveform strip — the karaoke captions remain the hero. Cover art:
     `cover` arg, else SOFIT_COVER env, else the mp3's embedded art, else a
     plain dark gradient.
+
+    Hesitation sounds (אממ, um, …) are cut from the picture, the audio, and the
+    karaoke by default. `defiller=False` keeps them. `defiller_cfg` overrides
+    the filler lists, the pause/confidence gate, and `min_gap`.
     Returns the list of output paths."""
     source = Path(video_path)
     out = Path(out_dir)
@@ -2317,10 +2501,27 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
             part_path = (output_path if len(ranges) == 1
                          else out / f"{clip_id}{suffix}.part{ri}.tmp.mp4")
 
+            # Hesitation sounds: plan the cuts on a copy of this span's words.
+            # The clip spec is not rewritten — a later --no-defiller render, or
+            # a caption correction, still sees the original tokens.
+            cfg = defiller_cfg or DefillerConfig()
+            raw_words = list(rng.get("words") or [])
+            plan = (plan_defill(raw_words, max(0.0, end - start), cfg)
+                    if defiller and raw_words else None)
+            cap_words = raw_words
+            drops = None
+            if plan and plan.cuts:
+                cap_words = plan.words
+                drops = plan.cuts
+                bits = ", ".join(
+                    f"{h.text}@{start + h.start:.2f}s" for h in plan.applied_hits)
+                print(f"defiller: {clip_id} span {ri} cut "
+                      f"{len(plan.applied_hits)} ({bits})", file=sys.stderr)
+
             # Word-level caption entries (kept for the highlight burn-in).
             caption_entries = None
-            if subtitles and rng.get("words"):
-                pseudo = {"start": start, "end": end, "words": rng["words"]}
+            if subtitles and cap_words:
+                pseudo = {"start": start, "end": end, "words": cap_words}
                 caption_entries = _caption_entries(_clip_transcript(pseudo), start, end)
 
             # Framing: explicit `focus` [0,1] wins. Otherwise track the on-screen
@@ -2338,6 +2539,10 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                 crop_position = float(focus)
             elif tw < th:
                 samples, aspect_hw, face_band, pair = _face_track(source, start, end)
+                # Keyframe `t` is evaluated on the shortened output, after the
+                # filler splice. Drop samples that landed inside a cut.
+                if drops and samples:
+                    samples = remap_face_samples(samples, plan.layout)
                 kf = _pan_keyframes(samples) if samples else []
                 crop_w_frac = (tw / th) * aspect_hw if aspect_hw else 0.0
                 if pair and crop_w_frac:
@@ -2387,17 +2592,22 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                 # per-span -ss offsets if it's ever audible.
                 cta=(cta if ri == len(ranges) - 1 else None),
                 music=music,
-                cutaways=[c for c in (clip.get("cutaways") or [])
-                          if int(c.get("span", 0)) == ri],
+                cutaways=_defill_cutaways(
+                    [c for c in (clip.get("cutaways") or [])
+                     if int(c.get("span", 0)) == ri], plan),
                 # Lower-thirds: {"name","title","at","dur","span"} in the clip
                 # spec; "at" is seconds within its span (like cutaways).
-                speaker_tags=[s for s in (clip.get("speaker_tags") or [])
-                              if int(s.get("span", 0)) == ri],
+                speaker_tags=_defill_at(
+                    [s for s in (clip.get("speaker_tags") or [])
+                     if int(s.get("span", 0)) == ri], plan),
                 # Brand pops: {"term","image","at","dur","span"} - "at" is
                 # span-local seconds, like cutaways and speaker tags.
-                brand_pops=[b for b in (clip.get("brand_pops") or [])
-                            if int(b.get("span", 0)) == ri],
+                brand_pops=_defill_at(
+                    [b for b in (clip.get("brand_pops") or [])
+                     if int(b.get("span", 0)) == ri], plan),
                 face_band=face_band,
+                drops=drops,
+                drop_crossfade=cfg.crossfade,
                 # Smoother narrative cuts: alternating punch-in + 30ms audio
                 # edge fades at the joins (concat stays lossless).
                 zoom=(1.07 if len(ranges) > 1 and ri % 2 else 1.0),

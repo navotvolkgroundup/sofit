@@ -95,8 +95,16 @@ Present the table; ask which numbers to render. Then build the spec from the pic
 ```
 - Crop-to-fill 9:16, speaker-tracking face crop, bold Hebrew word-highlight captions, logo top-left.
 - Narrative edits: a clip with `segments` (2+ kept spans) renders each span and
-  losslessly concats them — the filler between beats is cut automatically. The
+  losslessly concats them — banter between beats is cut automatically. The
   hook card goes on the first span only; captions/face-crop run per span.
+- Hesitation sounds are a separate pass, on by default: אמ / אממ / אהה / אהמ /
+  הממ / מממ, um / uh / hmm, and stretched spellings are removed from the
+  picture, the audio, and the karaoke. אם ("if") and a mid-sentence אה are
+  kept; אה is cut only between pauses or when confidence is low. Preview with
+  `--defiller-dry-run` (no render). Turn the pass off with `--no-defiller`.
+  `--defiller-min-gap` (default 0.40s) skips a cut that would leave a shorter
+  jump between two removals. The MCP `render_clips` tool takes the same
+  `defiller`, `defiller_dry_run`, and `defiller_min_gap` arguments.
 - Output is `<out_dir>/clip-N.mp4` (ids match the pool numbers). Copy to ~/Downloads as
   `WS<episode>_clip-N.mp4` for the user. This is the ONLY render path that honors caption
   corrections; `--render-clips` on the episode regenerates from the transcript.
@@ -126,6 +134,9 @@ Then re-render just the affected clip: `--render-from <clips.json> --only clip-N
 The find matches punctuation/whitespace-insensitively; verify with a rendered frame.
 
 ### 6. Cut a segment out of a clip (post-render trim)
+Hesitation *words* (אממ, um, an isolated אה) are already removed at render time —
+use `--defiller-dry-run` to see them, not this step. This step is for a moment
+the transcript does not mark as a filler: a gesture, a false start, a breath.
 Not in the spec (a clip is one start/end) — do it on the rendered mp4. Captions/audio/logo
 stay in sync (all baked into frames). Find the exact window by extracting frames first.
 ```bash
@@ -136,7 +147,9 @@ ffmpeg -v error -i in.mp4 -filter_complex \
 -map "[v]" -map "[a]" -c:v libx264 -pix_fmt yuv420p -preset medium -crf 20 \
 -c:a aac -b:a 128k -movflags +faststart -y out.mp4
 ```
-Caveat: a re-render (step 4) brings the full length back — re-apply the cut after.
+Caveat: a manual trim lives only on this mp4. A re-render cuts filler words again
+by itself, but it does not replay this trim — keep the pre-cut file and re-apply
+it after any re-render.
 
 ## Conventions & gotchas (learned the hard way)
 

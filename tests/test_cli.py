@@ -119,6 +119,55 @@ def test_render_clips_keeps_existing_corrected_spec(monkeypatch, tmp_path):
     assert spec.read_text(encoding="utf-8") == '{"corrected":true}'  # NOT clobbered
 
 
+def _filler_doc(tmp_path):
+    import json
+    video = tmp_path / "ep.mp4"
+    video.write_bytes(b"x")
+    doc = {"schema_version": 1, "source": {"video": str(video)}, "clips": [{
+        "id": "clip-1", "start": 12.0, "end": 15.0, "hook": "h",
+        "words": [
+            {"t": 0.00, "d": 0.40, "w": "אז"},
+            {"t": 0.50, "d": 0.40, "w": "אממ"},
+            {"t": 1.00, "d": 0.28, "w": "אם"},
+            {"t": 1.32, "d": 0.30, "w": "אתה"},
+            {"t": 1.66, "d": 0.40, "w": "רוצה"},
+        ],
+    }]}
+    p = tmp_path / "clips.json"
+    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def test_defiller_dry_run_reports_without_rendering(monkeypatch, tmp_path, capsys):
+    p = _filler_doc(tmp_path)
+    _no_transcribe(monkeypatch)
+    import sofit.render as r
+
+    def boom(*a, **k):
+        raise AssertionError("dry-run must not render")
+    monkeypatch.setattr(r, "render_clips", boom)
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "אממ" in out and "12.500" in out
+    assert any(ln.strip().startswith("cut") and "אממ" in ln.split() for ln in out.splitlines())
+    assert any(ln.strip().startswith("keep") and "אם" in ln.split() for ln in out.splitlines())
+
+
+def test_no_defiller_flag_reaches_render(monkeypatch, tmp_path):
+    p = _filler_doc(tmp_path)
+    _no_transcribe(monkeypatch)
+    import sofit.render as r
+    rendered = {}
+    monkeypatch.setattr(r, "render_clips",
+                        lambda v, clips, out, aspect="9:16", **k:
+                        (rendered.update(k) or []))
+    rc = cli.main(["--render-from", str(p), "--no-defiller",
+                   "--render-clips", str(tmp_path / "o")])
+    assert rc == 0
+    assert rendered["defiller"] is False
+
+
 def test_logo_flag_passes_through_to_render(monkeypatch, tmp_path):
     media = tmp_path / "WS203_EDIT.mp4"
     media.write_bytes(b"x")
