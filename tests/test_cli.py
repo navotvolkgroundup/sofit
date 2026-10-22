@@ -248,6 +248,7 @@ def test_skip_flag_and_file_veto_one_cut(monkeypatch, tmp_path, capsys):
                for ln in out.splitlines())
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 def test_elongation_flag_is_opt_in(monkeypatch, tmp_path, capsys):
     import math
     import struct
