@@ -431,3 +431,53 @@ def test_clip_spec_emits_segments_only_for_multi_beat_edits():
         segs, segs[-1].end)
     spec1 = gen.clip_spec(q1, segs, "clip-2")
     assert "segments" not in spec1 and spec1["words"]
+
+
+def test_json_image_transport_keeps_text_calls_compatible(monkeypatch, tmp_path):
+    from sofit import generate as g
+    image = tmp_path / 'frame.jpg'
+    image.write_bytes(b'jpeg')
+    seen = []
+    def transport(system, user, model, images=None):
+        seen.append(images)
+        return '{"ok":true}'
+    monkeypatch.setattr(g, '_call_api', transport)
+    assert g.call_claude_json('system', 'user', lambda x:x, images=[image]) == {'ok': True}
+    assert g.call_claude_json('system', 'user', lambda x:x) == {'ok': True}
+    assert seen == [[image], None]
+
+
+def test_image_cli_has_no_tools_and_failure_explains_login(monkeypatch, tmp_path):
+    import subprocess
+    import shutil
+    from types import SimpleNamespace
+    from sofit import generate as g
+    image = tmp_path / 'frame.jpg'
+    image.write_bytes(b'jpeg')
+    monkeypatch.setattr(shutil, 'which', lambda *a: '/bin/claude')
+    def run(cmd, **kwargs):
+        assert cmd[cmd.index('--tools') + 1] == ''
+        assert '--strict-mcp-config' in cmd and '--disable-slash-commands' in cmd
+        assert json.loads(kwargs['input'])['message']['content'][1]['source']['data'] == 'anBlZw=='
+        return SimpleNamespace(returncode=1, stdout='Not logged in', stderr='')
+    monkeypatch.setattr(subprocess, 'run', run)
+    with pytest.raises(g.GenerationError, match='Not logged in'):
+        g._call_claude_cli('system', 'user', 'model', images=[image])
+
+
+def test_image_cli_native_stream_result(monkeypatch, tmp_path):
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+    from sofit import generate as g
+    image = tmp_path / 'frame.jpg'
+    image.write_bytes(b'jpeg')
+    monkeypatch.setattr(shutil, 'which', lambda *a: '/bin/claude')
+    def run(cmd, **kwargs):
+        assert cmd[cmd.index('--input-format') + 1] == 'stream-json'
+        assert json.loads(kwargs['input'])['message']['content'][0]['text'] == 'inspect'
+        return SimpleNamespace(returncode=0, stderr='', stdout='\n'.join([
+            '{"type":"system","subtype":"init"}',
+            '{"type":"result","is_error":false,"result":"{\\"ok\\":true}"}']))
+    monkeypatch.setattr(subprocess, 'run', run)
+    assert g._call_claude_cli('system', 'inspect', 'model', images=[image]) == '{"ok":true}'
