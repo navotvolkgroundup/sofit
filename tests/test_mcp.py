@@ -26,6 +26,43 @@ def test_status_ready_when_cached(monkeypatch, tmp_path):
     assert m.transcription_status(str(f))["status"] == "ready"
 
 
+def test_render_clips_dry_run_does_not_render(monkeypatch, tmp_path):
+    f = tmp_path / "ep.mp4"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(m.transcribe, "cached_segments", lambda *a, **k: [object()])
+    clip = {"id": "clip-1", "start": 0.0, "end": 2.0, "words": [
+        {"t": 0.0, "d": 0.4, "w": "שלום"},
+        {"t": 0.5, "d": 0.4, "w": "אממ"},
+        {"t": 1.2, "d": 0.4, "w": "עולם"},
+    ]}
+    monkeypatch.setattr(m.generate, "make_clips", lambda *a, **k: [clip])
+    import sofit.render as r
+
+    def boom(*a, **k):
+        raise AssertionError("dry-run must not render")
+    monkeypatch.setattr(r, "render_clips", boom)
+    res = m.render_clips(str(f), str(tmp_path / "out"), defiller_dry_run=True)
+    assert res["dry_run"] is True
+    assert "אממ" in res["report"]
+    assert any(h["text"] == "אממ" and h["applied"] for row in res["spans"] for h in row["hits"])
+
+
+def test_render_clips_passes_defiller_flag(monkeypatch, tmp_path):
+    f = tmp_path / "ep.mp4"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(m.transcribe, "cached_segments", lambda *a, **k: [object()])
+    monkeypatch.setattr(m.generate, "make_clips", lambda *a, **k: [
+        {"id": "clip-1", "start": 0, "end": 1, "words": []},
+    ])
+    import sofit.render as r
+    seen = {}
+    monkeypatch.setattr(r, "render_clips",
+                        lambda *a, **k: (seen.update(k) or ["out/clip-1.mp4"]))
+    res = m.render_clips(str(f), str(tmp_path / "out"), defiller=False)
+    assert res["clips"] == 1
+    assert seen["defiller"] is False
+
+
 def test_tools_registered():
     # The tools are exposed on the FastMCP instance.
     import asyncio

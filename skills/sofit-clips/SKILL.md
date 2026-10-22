@@ -94,8 +94,31 @@ Present the table; ask which numbers to render. Build the spec from the picks:
   ~2.5s (last span only). `--music theme.mp3` / `SOFIT_MUSIC` ⇒ show's own theme
   looped + loudness-normalized + ducked under speech (audiogram clips only).
 - Narrative edits: a clip with `segments` (2+ kept spans) renders each span and
-  losslessly concats them — the filler between beats is cut automatically. The
+  losslessly concats them — banter between beats is cut automatically. The
   hook card goes on the first span only; captions/face-crop run per span.
+- Hesitations are cut out of the clip itself (picture, audio, and the
+  karaoke word), on by default. Clear fillers: אמ, אממ, אהה, אהמ, הממ, מממ,
+  English um / uh / hmm, and stretched spellings (אממממ, uhhh). אמ uses medial
+  mem מ, so it is not the word אם ("if", final mem ם). אה and אם are cut only
+  when the token sits between pauses (~0.22s each side, a clip edge counts) or
+  the word confidence is low — in a normal sentence they stay.
+  The ivrit-ai model often writes none of those tokens. A second pass reads
+  the span audio and, inside a gap of ≥0.30s, cuts a short steady voiced hum
+  (low pitch variance, flat envelope). It does not cut laughter, a breath,
+  the other host talking, or a silent pause, and it cuts only the hum — a
+  3s gap with a 0.4s אממ in the middle loses the אממ, not the pause. Each
+  kept piece is forced to a constant frame rate before the crossfade (the
+  source rate, the average rate when the file is variable-frame-rate, or
+  `SOFIT_FPS` when that override is set) so xfade does not reject 50fps
+  footage.
+  `--no-defiller` keeps every hesitation. `--defiller-dry-run` prints each
+  candidate with its source timestamp, `word` or `audio`, and a confidence,
+  and does not render. `--defiller-min-gap 0.40` (the default) skips a cut
+  that would leave less than 0.40s of speech between two cuts.
+  `--defiller-discourse` also cuts כאילו and the rest of the opt-in list
+  (off by default; כאילו is often a real word). Extra tokens:
+  `SOFIT_FILLERS` / `SOFIT_SHORT_FILLERS` / `SOFIT_DISCOURSE_FILLERS`.
+  The pass runs on the footage render. `--storyboard` is not defilled.
 - Output `<out_dir>/clip-N.mp4` (ids match the pool numbers). Copy to ~/Downloads as `WS<episode>_clip-N.mp4`.
 - Per-frame Pillow caption pass ⇒ seconds+ per clip; run in background.
 - Set-once logo: `export SOFIT_LOGO="$LOGO"` (then `--logo` optional). `--logo-pos {top-left,top-right,bottom-left,bottom-right}`.

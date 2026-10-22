@@ -8,6 +8,15 @@ description: Cut a segment (a filler moment, a nose-touch, an "um") out of an al
 Post-render trim on a finished mp4. A clip is one start/end in the spec, so this is NOT a
 spec edit — it operates on the rendered file. Captions/audio/logo stay in sync (all baked into frames).
 
+Hesitations are not this skill. Render already cuts them: transcript tokens
+(אמ / אממ / אהה / אהמ / הממ / מממ, um / uh / hmm, stretched spellings, an isolated
+or low-confidence אה / אם — "if" stays when it is just the word in a sentence)
+and a steady hum found in the audio of a gap, which is the usual case because
+ivrit-ai never writes אממ. `--defiller-dry-run` lists each cut with `word` or
+`audio` and a confidence; `--no-defiller` keeps the ums. Use sofit-trim for a
+moment the defiller leaves in — a gesture, a nose-touch, a laugh, a breath,
+the other host, a false start.
+
 ## Find the exact window first
 Extract frames around the moment and look, so START/END are precise:
 ```bash
@@ -25,5 +34,6 @@ ffmpeg -v error -i in.mp4 -filter_complex \
 ```
 Replace `START`/`END` with seconds (e.g. `15.9`/`18.0`).
 
-**Caveat:** a re-render (`/sofit-clips` or `--render-from`) brings the full length back — the cut
-lives only on this mp4, not in the spec. Keep the pre-cut file and re-apply the trim after any re-render.
+**Caveat:** a re-render (`/sofit-clips` or `--render-from`) cuts filler words again on its own,
+but it does not replay this trim — the cut lives only on this mp4, not in the spec. Keep the
+pre-cut file and re-apply the trim after any re-render.

@@ -112,23 +112,51 @@ def generate_kit(
 @mcp.tool()
 def render_clips(path: str, out_dir: str, aspect: str = "9:16", model: str = "",
                  logo: str = "", logo_pos: str = "top-left",
-                 hook_card: bool = True, hook_variant: int = 0) -> dict:
+                 hook_card: bool = True, hook_variant: int = 0,
+                 defiller: bool = True, defiller_dry_run: bool = False,
+                 defiller_min_gap: float = 0.40,
+                 defiller_discourse: bool = False) -> dict:
     """Render each pull-quote of an already-transcribed episode to a vertical
     (default 9:16) clip with burned Hebrew captions, written to out_dir. Pass
     `logo` (a transparent PNG path) to overlay it in the `logo_pos` corner of
-    every clip. Requires the transcript cached (call transcribe_episode first),
-    the [render] extra installed, and ffmpeg. Returns the output file paths."""
+    every clip.
+
+    Hesitation sounds are cut from the picture, the audio, and the karaoke by
+    default: transcript tokens (אממ, אה between pauses, um, uh, hmm, and
+    stretched spellings) and, where the transcript dropped them, a steady
+    voiced hum inside a gap of 0.30s or more. Laughter, breaths, the other
+    host, and a silent pause are left in. `defiller=false` keeps everything.
+    `defiller_min_gap` (seconds, default 0.40) is the minimum speech that
+    must remain between two cuts. `defiller_discourse=true` also cuts opt-in
+    words such as כאילו (off by default). `defiller_dry_run` returns each
+    candidate with its source time, whether it came from the word list or
+    the audio, and a confidence, and does not render.
+
+    Requires the transcript cached (call transcribe_episode first). A real
+    render also needs the [render] extra and ffmpeg. Returns the output file
+    paths, or the dry-run report."""
     segs = transcribe.cached_segments(path, model or transcribe.DEFAULT_MODEL)
     if segs is None:
         return {"error": "not transcribed yet — call transcribe_episode(path) first"}
+    clips = generate.make_clips(segs, titler="api")
+    from .defiller import analyze_clips, config_from_env, format_spans
+    cfg = config_from_env(defiller_min_gap, discourse=defiller_discourse)
+    if defiller_dry_run:
+        spans = analyze_clips(clips, cfg, media=path)
+        return {
+            "dry_run": True,
+            "defiller": defiller,
+            "report": format_spans(spans),
+            "spans": spans,
+        }
     try:
         from . import render
     except ImportError:
         return {"error": "install the render extra: pip install 'sofit-cli[render]'"}
-    clips = generate.make_clips(segs, titler="api")
     outs = render.render_clips(path, clips, out_dir, aspect=aspect,
                                logo=logo or None, logo_pos=logo_pos,
-                               hook_card=hook_card, hook_variant=hook_variant)
+                               hook_card=hook_card, hook_variant=hook_variant,
+                               defiller=defiller, defiller_cfg=cfg)
     result = {"clips": len(outs), "files": outs}
     # This path regenerates clips from the transcript, so it ignores any caption
     # corrections saved in a clips.json. Flag it so the fix isn't silently lost.
@@ -193,9 +221,11 @@ def correct_clip(clips_json: str, find: str, replace: str,
     to_render = [c for c in clips if c.get("id") in set(affected)]
     # Render FIRST — if it fails, the on-disk clips.json is never touched.
     try:
+        from .defiller import config_from_env
         outs = render.render_clips(video, to_render, out, aspect=aspect,
                                    logo=logo or None, logo_pos=logo_pos,
-                                   hook_card=hook_card, hook_variant=hook_variant)
+                                   hook_card=hook_card, hook_variant=hook_variant,
+                                   defiller_cfg=config_from_env())
     except Exception as e:  # noqa: BLE001 - surface render failure, keep file intact
         return {"error": f"render failed, clips.json unchanged: {e}"}
 

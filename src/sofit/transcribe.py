@@ -23,6 +23,10 @@ class Word:
     start: float
     end: float
     text: str
+    # faster-whisper's per-word probability, when the transcript was produced
+    # by a version that stores it. Older caches omit it; defiller then relies
+    # on pauses alone for the ambiguous short tokens (אה / אם).
+    probability: float | None = None
 
 
 @dataclass
@@ -130,7 +134,11 @@ def transcribe(
 
     segments: list[Segment] = []
     for i, seg in enumerate(raw_segments):
-        words = [Word(start=w.start, end=w.end, text=w.word) for w in (seg.words or [])]
+        words = [
+            Word(start=w.start, end=w.end, text=w.word,
+                 probability=getattr(w, "probability", None))
+            for w in (seg.words or [])
+        ]
         segments.append(
             Segment(index=i, start=seg.start, end=seg.end, text=seg.text.strip(), words=words)
         )

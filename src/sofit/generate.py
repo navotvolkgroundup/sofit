@@ -629,11 +629,17 @@ def _clip_words(segments: list[Segment], start: float, end: float) -> list[dict]
         if s.words:
             for w in s.words:
                 if start <= w.start <= end:
-                    out.append({
+                    item = {
                         "t": round(w.start - start, 3),
                         "d": round(max(w.end - w.start, 0.01), 3),
                         "w": w.text.strip(),
-                    })
+                    }
+                    # Only present when the transcript stored it, so older
+                    # clips.json files and the equality tests stay unchanged.
+                    prob = getattr(w, "probability", None)
+                    if prob is not None:
+                        item["p"] = round(float(prob), 3)
+                    out.append(item)
         else:
             toks = s.text.split()
             if not toks:
