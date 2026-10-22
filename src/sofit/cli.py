@@ -100,6 +100,22 @@ def _parser() -> argparse.ArgumentParser:
                    help="logo corner (default top-left)")
     p.add_argument("--no-hook-card", action="store_true",
                    help="don't burn the clip's hook as an opening title card")
+    p.add_argument("--no-defiller", action="store_true",
+                   help="keep hesitation sounds (אממ, אה, um, uh, …) in the "
+                        "rendered clip; by default they are cut from the "
+                        "picture, the audio, and the karaoke captions")
+    p.add_argument("--defiller-dry-run", action="store_true",
+                   help="list detected fillers (word tokens and audio hums) "
+                        "with timestamps, source, and confidence, and exit "
+                        "without rendering or cutting")
+    p.add_argument("--defiller-min-gap", type=float, default=None, metavar="SEC",
+                   help="minimum speech that must remain between two filler "
+                        "cuts, in seconds (default 0.40); a cut that would "
+                        "leave a shorter jump is skipped")
+    p.add_argument("--defiller-discourse", action="store_true",
+                   help="also cut opt-in discourse fillers such as כאילו "
+                        "(off by default: כאילו is often a real word). "
+                        "SOFIT_DISCOURSE_FILLERS appends more, comma-separated")
     p.add_argument("--hook-style", choices=["flash", "persistent"], default="flash",
                    help="hook card style: flash = big title, first ~1.8s only "
                    "(default); persistent = smaller boxed quote that stays up "
@@ -156,6 +172,20 @@ def _parse_char_refs(pairs: list[str] | None) -> dict[str, str]:
     return refs
 
 
+def _defiller_cfg(min_gap: float | None, discourse: bool = False):
+    from .defiller import config_from_env
+    return config_from_env(min_gap, discourse=discourse)
+
+
+def _print_defiller_report(clips: list[dict], min_gap: float | None,
+                           disabled: bool, media: str | None = None,
+                           discourse: bool = False) -> None:
+    from .defiller import format_report
+    print(format_report(clips, _defiller_cfg(min_gap, discourse), media=media))
+    if disabled:
+        print("(--no-defiller is set; a render would not cut these)", file=sys.stderr)
+
+
 def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | None,
                  logo: str | None = None, logo_pos: str = "top-left",
                  hook_card: bool = True, hook_variant: int = 0,
@@ -165,7 +195,10 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
                  storyboard: bool = False, style: str | None = None,
                  char_refs: dict[str, str] | None = None,
                  titler: str = "api", animate: bool = False,
-                 cutaways: bool = False) -> int:
+                 cutaways: bool = False,
+                 defiller: bool = True, defiller_dry_run: bool = False,
+                 defiller_min_gap: float | None = None,
+                 defiller_discourse: bool = False) -> int:
     """Render clips from a saved (possibly corrected) clips.json, no transcription.
     Output goes to `out_dir` if given, else the clips.json's own folder."""
     import json
@@ -193,6 +226,10 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
     if not clips:
         print(f"error: no clips in {clips_path}", file=sys.stderr)
         return 1
+    if defiller_dry_run:
+        _print_defiller_report(clips, defiller_min_gap, disabled=not defiller,
+                               media=video, discourse=defiller_discourse)
+        return 0
     if not video or not os.path.exists(video):
         print(f"error: source video not found: {video}", file=sys.stderr)
         return 1
@@ -234,7 +271,10 @@ def _render_from(clips_path: str, out_dir: str | None, aspect: str, only: str | 
                                logo_pos=logo_pos, hook_card=hook_card,
                                hook_variant=hook_variant, hook_style=hook_style,
                                safe_area=safe_area,
-                               cover=cover, cta=cta, music=music)
+                               cover=cover, cta=cta, music=music,
+                               defiller=defiller,
+                               defiller_cfg=_defiller_cfg(defiller_min_gap,
+                                                          defiller_discourse))
     print(f"rendered {len(outs)} clip(s) to {out}", file=sys.stderr)
     return 0
 
@@ -303,7 +343,11 @@ def main(argv: list[str] | None = None) -> int:
                             storyboard=args.storyboard, style=args.style,
                             char_refs=_parse_char_refs(args.char_ref),
                             titler=args.titler, animate=args.animate,
-                            cutaways=args.cutaways)
+                            cutaways=args.cutaways,
+                            defiller=not args.no_defiller,
+                            defiller_dry_run=args.defiller_dry_run,
+                            defiller_min_gap=args.defiller_min_gap,
+                            defiller_discourse=args.defiller_discourse)
 
     if args.storyboard:
         print("error: --storyboard renders from a saved spec; run once to get a "
@@ -470,7 +514,12 @@ def main(argv: list[str] | None = None) -> int:
                           f"rendering freshly-generated clips, which may differ. To render "
                           f"the saved spec instead: chapters --render-from {json_path}",
                           file=sys.stderr)
-            if args.render_clips:
+            if args.defiller_dry_run:
+                _print_defiller_report(clips, args.defiller_min_gap,
+                                       disabled=args.no_defiller,
+                                       media=media_path,
+                                       discourse=args.defiller_discourse)
+            elif args.render_clips:
                 try:
                     from . import render
                     outs = render.render_clips(media_path, clips, args.render_clips,
@@ -481,7 +530,11 @@ def main(argv: list[str] | None = None) -> int:
                                                hook_style=args.hook_style,
                                                safe_area=args.safe_area,
                                                cover=args.cover,
-                                               cta=args.cta, music=args.music)
+                                               cta=args.cta, music=args.music,
+                                               defiller=not args.no_defiller,
+                                               defiller_cfg=_defiller_cfg(
+                                                   args.defiller_min_gap,
+                                                   args.defiller_discourse))
                     print(f"rendered {len(outs)} clips to {args.render_clips}", file=sys.stderr)
                 except ImportError:
                     print("error: --render-clips needs the render extra: pip install 'sofit-cli[render]'", file=sys.stderr)

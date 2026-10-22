@@ -475,6 +475,244 @@ def test_speed_change_keeps_the_limiter(monkeypatch, tmp_path):
     assert "atempo=1.5" in af and "alimiter" in af
 
 
+def test_render_clips_cuts_fillers_shifts_captions_keeps_overlays(monkeypatch, tmp_path):
+    # The filler leaves the karaoke and the picture; the next word moves
+    # earlier by the same amount. Hook, logo, speaker tag, and the brand
+    # pass still run. The clip spec itself is not rewritten.
+    import sofit.render as r
+    calls = []
+    monkeypatch.setattr(r, "extract_clip", lambda **k: calls.append(k))
+    branded = {}
+    monkeypatch.setattr(r, "_apply_brand_overlays",
+                        lambda *a, **k: branded.setdefault("yes", True))
+    words = [
+        {"t": 0.0, "d": 0.40, "w": "שלום"},
+        {"t": 0.50, "d": 0.40, "w": "אממ"},
+        {"t": 1.20, "d": 0.50, "w": "עולם"},
+    ]
+    clip = {"id": "clip-1", "hook": "הוק", "focus": 0.5,
+            "start": 10.0, "end": 12.0, "words": words,
+            "speaker_tags": [{"name": "נבות", "at": 1.20, "dur": 2.0, "span": 0}],
+            "logo_note": True}
+    r.render_clips("v.mp4", [clip], str(tmp_path), subtitles=True, logo="/tmp/logo.png")
+    assert calls, "extract_clip was not called"
+    k = calls[0]
+    assert k["hook"] == "הוק"
+    assert k["logo"] is None or k["logo"]  # passed through; file may not exist
+    assert "logo" in k
+    texts = [w["text"] for e in k["caption_entries"] for w in e["words"]]
+    assert texts == ["שלום", "עולם"]
+    olam = next(w for e in k["caption_entries"] for w in e["words"] if w["text"] == "עולם")
+    assert olam["start"] < 1.20
+    assert k["drops"] and k["drops"][0][0] < 0.55 and k["drops"][0][1] > 0.85
+    assert k["speaker_tags"][0]["at"] == pytest.approx(olam["start"], abs=0.05)
+    assert k["speaker_tags"][0]["name"] == "נבות"
+    # Spec unchanged — corrections and a later --no-defiller render still see אממ.
+    assert [w["w"] for w in clip["words"]] == ["שלום", "אממ", "עולם"]
+    assert clip["speaker_tags"][0]["at"] == 1.20
+    assert branded.get("yes") is True
+
+    # Real words in a tight sentence are not a cut, and --no via defiller=False
+    # leaves an obvious filler in the captions.
+    calls.clear()
+    plain = {"id": "clip-2", "hook": "הוק", "focus": 0.5, "start": 0.0, "end": 1.2,
+             "words": [
+                 {"t": 0.00, "d": 0.30, "w": "אם"},
+                 {"t": 0.34, "d": 0.30, "w": "אתה"},
+                 {"t": 0.68, "d": 0.30, "w": "רוצה"},
+             ]}
+    r.render_clips("v.mp4", [plain], str(tmp_path), subtitles=True)
+    texts = [w["text"] for e in calls[-1]["caption_entries"] for w in e["words"]]
+    assert texts == ["אם", "אתה", "רוצה"]
+    assert not calls[-1].get("drops")
+
+
+def test_render_clips_defiller_off_keeps_the_filler(monkeypatch, tmp_path):
+    import sofit.render as r
+    calls = []
+    monkeypatch.setattr(r, "extract_clip", lambda **k: calls.append(k))
+    monkeypatch.setattr(r, "_apply_brand_overlays", lambda *a, **k: None)
+    clip = {"id": "clip-1", "hook": "הוק", "focus": 0.5, "start": 0.0, "end": 2.0,
+            "words": [
+                {"t": 0.0, "d": 0.4, "w": "שלום"},
+                {"t": 0.5, "d": 0.4, "w": "אממ"},
+                {"t": 1.2, "d": 0.4, "w": "עולם"},
+            ]}
+    r.render_clips("v.mp4", [clip], str(tmp_path), defiller=False)
+    texts = [w["text"] for e in calls[0]["caption_entries"] for w in e["words"]]
+    assert "אממ" in texts
+    assert not calls[0].get("drops")
+
+
+def test_defiller_remaps_face_track_samples(monkeypatch, tmp_path):
+    # A face sample that landed on the filler must not stay on the old clock.
+    import sofit.render as r
+    seen = {}
+
+    def face(source, start, end, step=0.25):
+        return ([(0.20, 0.30), (0.70, 0.80), (1.50, 0.40)], 1.7, (0.2, 0.5), None)
+
+    def pan(samples, cut_delta=0.12, min_run=2):
+        seen["samples"] = list(samples)
+        return []
+
+    monkeypatch.setattr(r, "_is_audio_only", lambda source: False)
+    monkeypatch.setattr(r, "_face_track", face)
+    monkeypatch.setattr(r, "_pan_keyframes", pan)
+    monkeypatch.setattr(r, "extract_clip", lambda **k: seen.setdefault("call", k))
+    monkeypatch.setattr(r, "_apply_brand_overlays", lambda *a, **k: None)
+    clip = {"id": "clip-1", "start": 0.0, "end": 2.0,  # no focus → face track
+            "words": [
+                {"t": 0.0, "d": 0.40, "w": "שלום"},
+                {"t": 0.50, "d": 0.40, "w": "אממ"},   # covers t=0.70
+                {"t": 1.20, "d": 0.50, "w": "עולם"},
+            ]}
+    r.render_clips("v.mp4", [clip], str(tmp_path), subtitles=False)
+    times = [t for t, _cx in seen["samples"]]
+    assert 0.70 not in [round(t, 2) for t in times]
+    assert any(t < 0.3 for t in times) and any(t > 0.5 for t in times)
+    # The surviving late sample moved earlier by about the cut.
+    assert max(times) < 1.50
+
+
+def test_splice_filter_renders_a_shorter_clip(tmp_path):
+    """The crossfade graph actually runs: the middle second is gone."""
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg")
+    from sofit.defiller import splice_layout
+    from sofit.render import _run_ffmpeg, _splice_av_filters
+
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=3",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+         "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         "-y", str(src)],
+        check=True,
+    )
+    layout, out_dur, xf = splice_layout([(0.0, 1.0), (2.0, 3.0)], 0.02)
+    parts, vlabel, alabel = _splice_av_filters(layout, xf, source_duration=3.0)
+    out = tmp_path / "out.mp4"
+    _run_ffmpeg([
+        "ffmpeg", "-i", str(src), "-filter_complex", ";".join(parts),
+        "-map", f"[{vlabel}]", "-map", f"[{alabel}]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-y", str(out),
+    ])
+    probed = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, check=True,
+    )
+    got = float(probed.stdout.strip())
+    # 1s + 1s - 20ms crossfade. AAC priming can add a few tens of ms.
+    assert abs(got - out_dur) < 0.15, f"duration {got} vs planned {out_dur}"
+
+
+def test_choose_xfade_fps_uses_source_rate_average_for_vfr_and_override():
+    from sofit.render import choose_xfade_fps
+    assert choose_xfade_fps("50/1", "50/1") == "50/1"
+    # Within 2% the file is CFR; keep the nominal rate, not the average.
+    assert choose_xfade_fps("50/1", "49.5/1") == "50/1"
+    # Trimmed 50fps pieces lose their CFR tag. A variable-rate file is the
+    # same failure with a different number: r_frame_rate is a guess, the
+    # average is what xfade should be forced to.
+    assert choose_xfade_fps("50/1", "2125/49") == "2125/49"
+    assert choose_xfade_fps("90000/1", "30000/1001") == "30000/1001"
+    assert choose_xfade_fps("0/0", "0/0") == "30"
+    assert choose_xfade_fps("50/1", "50/1", override="25") == "25"
+
+
+def test_splice_filter_forces_fps_on_50fps_and_vfr(tmp_path, monkeypatch):
+    """xfade rejects trimmed pieces that lost their constant frame rate.
+
+    50fps Weekly Sync footage hits "xfade: inputs need constant frame rate"
+    after trim+setpts. The graph has to stamp the source rate (or the
+    average, for VFR) onto every piece. An output override wins over both.
+    """
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg")
+    from sofit.defiller import splice_layout
+    from sofit.render import _run_ffmpeg, _splice_av_filters, constant_fps_for_xfade
+
+    src = tmp_path / "src50.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=50:duration=3",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+         "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-video_track_timescale", "90000", "-c:a", "aac",
+         "-y", str(src)],
+        check=True,
+    )
+    rate = constant_fps_for_xfade(src)
+    assert rate == "50/1"
+    layout, out_dur, xf = splice_layout([(0.0, 1.0), (2.0, 3.0)], 0.02)
+    parts, vlabel, alabel = _splice_av_filters(
+        layout, xf, source_duration=3.0, fps=rate)
+    graph = ";".join(parts)
+    assert graph.count(f"fps={rate}") == 2
+    out = tmp_path / "out50.mp4"
+    _run_ffmpeg([
+        "ffmpeg", "-i", str(src), "-filter_complex", graph,
+        "-map", f"[{vlabel}]", "-map", f"[{alabel}]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-y", str(out),
+    ])
+    probed = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, check=True,
+    )
+    got = float(probed.stdout.strip())
+    assert abs(got - out_dur) < 0.15, f"duration {got} vs planned {out_dur}"
+
+    # Dropping every 7th frame makes r_frame_rate and avg_frame_rate disagree.
+    vfr = tmp_path / "vfr.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc=size=320x240:rate=50:duration=2",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+         "-vf", "select='not(eq(mod(n,7),0))',setpts=PTS-STARTPTS",
+         "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest",
+         "-y", str(vfr)],
+        check=True,
+    )
+    vfr_rate = constant_fps_for_xfade(vfr)
+    assert vfr_rate not in ("50/1", "30")
+    layout, out_dur, xf = splice_layout([(0.0, 0.7), (1.2, 1.9)], 0.02)
+    parts, vlabel, alabel = _splice_av_filters(
+        layout, xf, source_duration=2.0, fps=vfr_rate)
+    assert f"fps={vfr_rate}" in ";".join(parts)
+    _run_ffmpeg([
+        "ffmpeg", "-i", str(vfr), "-filter_complex", ";".join(parts),
+        "-map", f"[{vlabel}]", "-map", f"[{alabel}]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-y", str(tmp_path / "out_vfr.mp4"),
+    ])
+
+    monkeypatch.setenv("SOFIT_FPS", "25")
+    assert constant_fps_for_xfade(src) == "25"
+
+
+def test_splice_filter_crossfades_audio_and_video():
+    from sofit.defiller import splice_layout
+    from sofit.render import _splice_av_filters
+    layout, out_dur, xf = splice_layout([(0.0, 1.0), (1.4, 3.0)], 0.02)
+    parts, vlabel, alabel = _splice_av_filters(layout, xf, source_duration=3.0)
+    graph = ";".join(parts)
+    assert "atrim=start=0.0000:end=1.0000" in graph
+    assert "atrim=start=1.4000:end=3.0000" in graph
+    assert f"xfade=transition=fade:duration={xf:.4f}" in graph
+    assert f"acrossfade=d={xf:.4f}" in graph
+    assert vlabel == "vcat" and alabel == "acat"
+    assert out_dur == pytest.approx(1.0 + 1.6 - xf, abs=1e-6)
+
+
 def test_render_clips_narrative_segments_render_per_span_and_concat(monkeypatch, tmp_path):
     # A clip with `segments` (narrative edit) renders each kept span through the
     # single-range pipeline — hook card on the FIRST span only, captions from
