@@ -161,6 +161,23 @@ Caveat: a manual trim lives only on this mp4. A re-render cuts filler words agai
 by itself, but it does not replay this trim — keep the pre-cut file and re-apply
 it after any re-render.
 
+## Optional real web footage
+
+For requests to use authentic footage or real B-roll, follow the Real web footage
+section in [`../sofit-clips/SKILL.md`](../sofit-clips/SKILL.md). After picking clips,
+run the **local editable CLI** with `--render-from <spec> --web-cutaways`.
+Audio-only clips target 85% moving footage; use `--footage-coverage 90` for an
+explicit target. Supply episode context and exact subject/version, prefer primary
+publishers, and inspect the rendered `.coverage.json` gaps as well as the video.
+Install the `youtube` extra and Deno or Node 22+ to search YouTube alongside
+Commons. Use repeatable `--footage-url URL` for provided YouTube/direct-video
+links, and `--footage-after YYYY-MM-DD` for an explicit upload-date cutoff.
+`--web-cutaways-safe-only` enables the conservative metadata filter; `--cutaways`
+allows generated fallback. Keep the saved plan/provenance, inspect frames and
+continuous audio/captions, and use normal `--render-from` for corrected rerenders.
+The provider and selection logic belong to Sofit itself; do not recreate them
+as ad hoc agent downloads.
+
 ## Conventions & gotchas (learned the hard way)
 
 - **Always verify with a real rendered frame**, don't trust code reads — extract with
