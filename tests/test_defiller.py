@@ -272,6 +272,7 @@ def test_dry_run_report_on_sample_transcript():
     for token in ("אממ", "אה", "um", "המממ"):
         line = next(ln for ln in report.splitlines() if token in ln.split())
         assert line.strip().startswith("cut"), line
+        assert "word" in line.split()
     # אם in "אם אתה רוצה", plus the real words, are not cut.
     for token in ("אם", "אהבה", "אמא", "המון", "אומה"):
         cut_lines = [ln for ln in report.splitlines()
@@ -286,6 +287,44 @@ def test_dry_run_report_on_sample_transcript():
     assert {h.text for h in plan.applied_hits} >= {"אממ", "אה", "um", "המממ"}
     assert all(h.text != "אם" or not h.applied for h in plan.hits)
     assert "אהבה" not in {h.text for h in plan.hits}
+
+
+def test_discourse_fillers_are_off_unless_opted_in(monkeypatch):
+    # כאילו is often a real word. The default plan must not cut it, and the
+    # environment must not leak into DefillerConfig().
+    words, dur = _span(
+        (0.0, 0.40, "זה"),
+        (0.50, 0.35, "כאילו"),
+        (1.00, 0.40, "ברור"),
+        dur=1.6,
+    )
+    assert "כאילו" in _texts(plan_defill(words, dur))
+    assert "כאילו" not in DefillerConfig().discourse
+
+    opted = config_from_env(discourse=True)
+    assert "כאילו" in opted.discourse
+    assert "כאילו" not in _texts(plan_defill(words, dur, opted))
+    hit = next(h for h in plan_defill(words, dur, opted).hits if h.text == "כאילו")
+    assert hit.applied and hit.reason == "discourse" and hit.source == "word"
+
+    monkeypatch.setenv("SOFIT_DISCOURSE_FILLERS", "כאילו")
+    env_cfg = config_from_env()
+    assert "כאילו" in env_cfg.discourse
+    # The plain constructor ignores the environment, so the default plan
+    # still keeps כאילו. Only config_from_env sees the variable.
+    assert "כאילו" in _texts(plan_defill(words, dur))
+    assert "כאילו" not in _texts(plan_defill(words, dur, env_cfg))
+
+
+def test_missing_media_keeps_the_word_report_and_says_why():
+    clip = {"id": "clip-9", "start": 0.0, "end": 2.0, "words": [
+        {"t": 0.0, "d": 0.4, "w": "שלום"},
+        {"t": 0.5, "d": 0.4, "w": "אממ"},
+        {"t": 1.2, "d": 0.4, "w": "עולם"},
+    ]}
+    report = format_report([clip], media="/no/such/episode.mp4")
+    assert "אממ" in report
+    assert "source video not found" in report
 
 
 def test_classify_table():

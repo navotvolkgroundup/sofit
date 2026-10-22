@@ -97,14 +97,22 @@ Present the table; ask which numbers to render. Then build the spec from the pic
 - Narrative edits: a clip with `segments` (2+ kept spans) renders each span and
   losslessly concats them — banter between beats is cut automatically. The
   hook card goes on the first span only; captions/face-crop run per span.
-- Hesitation sounds are a separate pass, on by default: אמ / אממ / אהה / אהמ /
-  הממ / מממ, um / uh / hmm, and stretched spellings are removed from the
-  picture, the audio, and the karaoke. אם ("if") and a mid-sentence אה are
-  kept; אה is cut only between pauses or when confidence is low. Preview with
-  `--defiller-dry-run` (no render). Turn the pass off with `--no-defiller`.
-  `--defiller-min-gap` (default 0.40s) skips a cut that would leave a shorter
-  jump between two removals. The MCP `render_clips` tool takes the same
-  `defiller`, `defiller_dry_run`, and `defiller_min_gap` arguments.
+- Hesitations are cut from the picture, the audio, and the karaoke, on by
+  default. Two detectors feed the same cut:
+  - Word tokens: אמ / אממ / אהה / אהמ / הממ / מממ, um / uh / hmm, and stretched
+    spellings. אם ("if") and a mid-sentence אה stay; אה is cut only between
+    pauses or when confidence is low.
+  - Audio, because ivrit-ai drops אממ / אה even when the prompt mentions them.
+    Inside a gap of ≥0.30s, a short steady voiced hum is a hesitation. Only
+    that hum is cut, not the pause around it. Laughter, a breath, the other
+    host, and a silent dramatic pause stay.
+  `--defiller-dry-run` prints each candidate with its source time, where it
+  came from (`word` or `audio`), and a confidence, and does not render.
+  `--no-defiller` keeps them. `--defiller-min-gap` (default 0.40s) skips a cut
+  that would leave a shorter jump between two removals. `--defiller-discourse`
+  also cuts opt-in words such as כאילו (off by default — כאילו is often a real
+  word); `SOFIT_DISCOURSE_FILLERS` adds more. The MCP `render_clips` tool takes
+  `defiller`, `defiller_dry_run`, `defiller_min_gap`, and `defiller_discourse`.
 - Output is `<out_dir>/clip-N.mp4` (ids match the pool numbers). Copy to ~/Downloads as
   `WS<episode>_clip-N.mp4` for the user. This is the ONLY render path that honors caption
   corrections; `--render-clips` on the episode regenerates from the transcript.
@@ -134,9 +142,11 @@ Then re-render just the affected clip: `--render-from <clips.json> --only clip-N
 The find matches punctuation/whitespace-insensitively; verify with a rendered frame.
 
 ### 6. Cut a segment out of a clip (post-render trim)
-Hesitation *words* (אממ, um, an isolated אה) are already removed at render time —
-use `--defiller-dry-run` to see them, not this step. This step is for a moment
-the transcript does not mark as a filler: a gesture, a false start, a breath.
+Hesitations are already removed at render time — both the transcript tokens
+(אממ, um, an isolated אה) and a steady hum the transcriber never wrote down.
+`--defiller-dry-run` lists them with source (`word` or `audio`) and confidence.
+This step is for a moment the defiller is built to leave in: a gesture, a
+laugh, a breath, the other host, a deliberate pause.
 Not in the spec (a clip is one start/end) — do it on the rendered mp4. Captions/audio/logo
 stay in sync (all baked into frames). Find the exact window by extracting frames first.
 ```bash

@@ -28,6 +28,15 @@ render joins the kept pieces with a short audio/video crossfade.
 The lists are `CLEAR_FILLERS` and `SHORT_FILLERS`. `DefillerConfig` replaces
 them; `SOFIT_FILLERS` / `SOFIT_SHORT_FILLERS` (comma-separated) append to
 them when `config_from_env` builds the config the CLI and MCP use.
+
+Word matching is not enough. ivrit-ai faster-whisper drops אממ / אה even
+when the prompt mentions them, so a dry run on a real episode can report
+zero fillers while the ums are plainly in the audio. When PCM for the span
+is passed in, gaps of `audio_gap` seconds or longer are scanned for a short
+steady hum (`hesitation.analyze_pcm`). Laughter, breaths, the other host,
+and a silent pause are not cuts. Discourse words such as כאילו are a third
+list, empty unless the caller opts in (`--defiller-discourse` or
+`SOFIT_DISCOURSE_FILLERS`) — כאילו is often a real word.
 """
 
 from __future__ import annotations
@@ -61,6 +70,11 @@ SHORT_FILLERS: tuple[str, ...] = (
     "hm",
 )
 
+# Words that are often real. Not consulted unless the caller opts in.
+DISCOURSE_FILLERS: tuple[str, ...] = (
+    "כאילו",
+)
+
 # Niqqud, cantillation, maqaf, and other Hebrew marks — not letters.
 _HEBREW_MARKS = re.compile(r"[\u0591-\u05C7]")
 _BIDI_MARKS = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
@@ -84,22 +98,36 @@ class DefillerConfig:
     min_cut: float = 0.06
     clear: tuple[str, ...] = CLEAR_FILLERS
     short: tuple[str, ...] = SHORT_FILLERS
+    # Empty unless opted in. כאילו lives in DISCOURSE_FILLERS, not here.
+    discourse: tuple[str, ...] = ()
+    # Audio-gap scan. On with the defiller; `--no-defiller` skips the pass.
+    audio: bool = True
+    audio_gap: float = 0.30
+    audio_min_confidence: float = 0.72
 
 
-def config_from_env(min_gap: float | None = None) -> DefillerConfig:
+def config_from_env(min_gap: float | None = None, discourse: bool = False) -> DefillerConfig:
     """Default config, plus comma-separated extras from the environment.
 
     `SOFIT_FILLERS` appends to the clear list, `SOFIT_SHORT_FILLERS` to the
-    ambiguous list. Tests build `DefillerConfig()` directly so they stay
-    hermetic; the CLI and MCP call this.
+    ambiguous list. `discourse=True` (the `--defiller-discourse` flag) turns
+    on `DISCOURSE_FILLERS`; `SOFIT_DISCOURSE_FILLERS` appends either way, so
+    setting the variable is itself the opt-in. Tests build `DefillerConfig()`
+    directly so they stay hermetic; the CLI and MCP call this.
     """
     cfg = DefillerConfig()
     extra_clear = _split_env("SOFIT_FILLERS")
     extra_short = _split_env("SOFIT_SHORT_FILLERS")
+    extra_discourse = _split_env("SOFIT_DISCOURSE_FILLERS")
     if extra_clear:
         cfg = replace(cfg, clear=cfg.clear + extra_clear)
     if extra_short:
         cfg = replace(cfg, short=cfg.short + extra_short)
+    disc: tuple[str, ...] = DISCOURSE_FILLERS if discourse else ()
+    if extra_discourse:
+        disc = disc + extra_discourse
+    if disc:
+        cfg = replace(cfg, discourse=disc)
     if min_gap is not None:
         cfg = replace(cfg, min_gap=min_gap)
     return cfg
@@ -123,6 +151,11 @@ class FillerHit:
     applied: bool
     cut_start: float | None = None
     cut_end: float | None = None
+    # "word" for a transcript token, "audio" for a hum found in a gap.
+    source: str = "word"
+    # 1.0 when a clear token matched and the transcript has no probability.
+    # None when we have nothing to report (an ambiguous token left in).
+    confidence: float | None = None
 
 
 @dataclass
@@ -180,10 +213,12 @@ def is_stretch(token: str, base: str) -> bool:
 
 
 def classify_token(token: str, cfg: DefillerConfig) -> str | None:
-    """'clear', 'short', or None. `token` must already be normalized.
+    """'clear', 'discourse', 'short', or None. `token` must already be normalized.
 
     A stretched ambiguous token ("אההה", "אםם") is classified clear: the extra
-    letters mean it is no longer the dictionary word.
+    letters mean it is no longer the dictionary word. Discourse tokens are
+    whole-token stretches of the opt-in list; with the default empty list
+    this branch matches nothing.
     """
     if not token or any(ch.isspace() for ch in token) or len(token) > 24:
         return None
@@ -191,6 +226,10 @@ def classify_token(token: str, cfg: DefillerConfig) -> str | None:
         b = normalize_token(base)
         if b and is_stretch(token, b):
             return "clear"
+    for base in cfg.discourse:
+        b = normalize_token(base)
+        if b and is_stretch(token, b):
+            return "discourse"
     for base in cfg.short:
         b = normalize_token(base)
         if not b:
@@ -461,13 +500,19 @@ def _suppress_short_islands(duration: float, cuts: list[tuple[float, float]],
 
 
 def plan_defill(words: list[dict], duration: float,
-                cfg: DefillerConfig | None = None) -> DefillPlan:
+                cfg: DefillerConfig | None = None,
+                pcm=None, sample_rate: int = 8000) -> DefillPlan:
     """Plan filler cuts for one span.
 
     `words` are clip-relative ({t, d, w}) or transcript-shaped ({start, end,
     text}). `duration` is the span length in the same clock. The returned
     `words` have filler tokens removed and the survivors shifted onto the
     output timeline (crossfade overlap included).
+
+    `pcm` is optional mono audio of the span (sample 0 at t=0). When the
+    config's audio scan is on, voiced hums inside gaps join the same cut
+    list as the word fillers, so min_gap, the crossfade, and the caption
+    shift apply to both.
     """
     cfg = cfg or DefillerConfig()
     src = [coerce_word(w) for w in words]
@@ -483,9 +528,9 @@ def plan_defill(words: list[dict], duration: float,
             continue
         before, after = _gaps(src, i)
         prob = _word_prob(word)
-        if kind == "clear":
-            reason = "pattern"
-            detail = "clear filler"
+        if kind in ("clear", "discourse"):
+            reason = "pattern" if kind == "clear" else "discourse"
+            detail = "clear filler" if kind == "clear" else "opt-in discourse filler"
             eligible = True
         else:
             low = prob is not None and prob < cfg.low_confidence
@@ -521,7 +566,20 @@ def plan_defill(words: list[dict], duration: float,
             "detail": detail,
             "eligible": eligible,
             "bounds": bounds,
+            "prob": prob,
         })
+
+    audio_regions: list[dict] = []
+    if pcm is not None and cfg.audio and duration > 0:
+        from .hesitation import analyze_pcm
+        audio_regions = analyze_pcm(
+            pcm, sample_rate, src, duration,
+            gap=cfg.audio_gap, padding=cfg.padding, min_cut=cfg.min_cut,
+            min_confidence=cfg.audio_min_confidence,
+        )
+        for region in audio_regions:
+            if region.get("eligible") and region.get("cut_end", 0) > region.get("cut_start", 0):
+                raw_cuts.append((region["cut_start"], region["cut_end"]))
 
     cuts = merge_cuts(raw_cuts)
     cuts = _absorb_silence(duration, cuts, src, cfg.min_gap)
@@ -554,6 +612,7 @@ def plan_defill(words: list[dict], duration: float,
         reason = item["reason"]
         if item["eligible"] and not applied:
             reason = "hollow" if hollow else "min_gap"
+        prob = item["prob"]
         hits.append(FillerHit(
             text=word["w"],
             start=word["t"],
@@ -563,6 +622,39 @@ def plan_defill(words: list[dict], duration: float,
             applied=applied,
             cut_start=bounds[0] if bounds else None,
             cut_end=bounds[1] if bounds else None,
+            source="word",
+            confidence=prob if prob is not None else (1.0 if applied else None),
+        ))
+
+    for region in audio_regions:
+        applied = bool(
+            region.get("eligible") and cuts
+            and any(s - 1e-6 <= (region["start"] + region["end"]) / 2.0 <= e + 1e-6
+                    for s, e in cuts)
+        )
+        detail = region["detail"]
+        reason = region["reason"]
+        if region.get("eligible") and not applied:
+            if hollow:
+                reason = "hollow"
+                detail = f"{detail}; skipped — cutting it would leave under 0.45s of clip"
+            else:
+                reason = "min_gap"
+                detail = (
+                    f"{detail}; skipped — cutting it would leave under "
+                    f"{cfg.min_gap:.2f}s of speech between cuts"
+                )
+        hits.append(FillerHit(
+            text=region["text"],
+            start=region["start"],
+            end=region["end"],
+            reason=reason,
+            detail=detail,
+            applied=applied,
+            cut_start=region.get("cut_start"),
+            cut_end=region.get("cut_end"),
+            source="audio",
+            confidence=region.get("confidence"),
         ))
 
     keeps = keep_intervals(duration, cuts)
@@ -609,9 +701,19 @@ def iter_clip_spans(clip: dict) -> list[tuple[int, float, float, list[dict]]]:
     return [(0, start, end, list(clip.get("words") or []))]
 
 
-def analyze_clips(clips: list[dict], cfg: DefillerConfig | None = None) -> list[dict]:
-    """Structured dry-run: one entry per span, hits in source-absolute seconds."""
+def analyze_clips(clips: list[dict], cfg: DefillerConfig | None = None,
+                  media: str | None = None) -> list[dict]:
+    """Structured dry-run: one entry per span, hits in source-absolute seconds.
+
+    `media` is the source file. When it is set and the audio scan is on,
+    each span with a long enough gap is decoded and hummed-over gaps join
+    the hits. A missing file or a decode failure leaves the word hits and
+    sets `audio_note` on every row.
+    """
     cfg = cfg or DefillerConfig()
+    note = _audio_note(media, cfg)
+    readable = note is None and bool(media) and cfg.audio
+    failed = False
     rows = []
     for clip in clips:
         clip_id = str(clip.get("id") or "clip")
@@ -620,7 +722,16 @@ def analyze_clips(clips: list[dict], cfg: DefillerConfig | None = None) -> list[
             if dur <= 0 and words:
                 coerced = [coerce_word(w) for w in words]
                 dur = max(w["t"] + w["d"] for w in coerced)
-            plan = plan_defill(words, dur, cfg)
+            pcm = None
+            if readable and not failed and dur > 0 and words:
+                from .hesitation import has_scannable_gap, read_pcm
+                coerced = [coerce_word(w) for w in words]
+                if has_scannable_gap(coerced, dur, cfg.audio_gap):
+                    pcm = read_pcm(media, start, dur)
+                    if pcm is None:
+                        failed = True
+                        note = "audio scan skipped: could not read source audio"
+            plan = plan_defill(words, dur, cfg, pcm=pcm)
             hits = []
             for hit in plan.hits:
                 hits.append({
@@ -630,22 +741,34 @@ def analyze_clips(clips: list[dict], cfg: DefillerConfig | None = None) -> list[
                     "applied": hit.applied,
                     "reason": hit.reason,
                     "detail": hit.detail,
+                    "source": hit.source,
+                    "confidence": (None if hit.confidence is None
+                                   else round(hit.confidence, 3)),
                 })
-            rows.append({
+            row = {
                 "clip": clip_id,
                 "span": span_i,
                 "span_start": round(start, 3),
                 "span_end": round(start + dur, 3),
                 "cuts": len(plan.applied_hits),
                 "hits": hits,
-            })
+            }
+            if note:
+                row["audio_note"] = note
+            rows.append(row)
     return rows
 
 
-def format_report(clips: list[dict], cfg: DefillerConfig | None = None) -> str:
-    """Human-readable dry-run. Times are absolute on the source clock."""
-    cfg = cfg or DefillerConfig()
-    rows = analyze_clips(clips, cfg)
+def _audio_note(media: str | None, cfg: DefillerConfig) -> str | None:
+    if not cfg.audio or not media:
+        return None
+    if not os.path.exists(media):
+        return "audio scan skipped: source video not found"
+    return None
+
+
+def format_spans(rows: list[dict]) -> str:
+    """Render `analyze_clips` rows. Times are absolute on the source clock."""
     if not rows:
         return "defiller: no clips"
     lines: list[str] = []
@@ -656,7 +779,7 @@ def format_report(clips: list[dict], cfg: DefillerConfig | None = None) -> str:
             f"source {row['span_start']:.3f}–{row['span_end']:.3f}s"
         )
         if not row["hits"]:
-            lines.append("  no filler-shaped tokens")
+            lines.append("  no filler candidates")
             continue
         for hit in row["hits"]:
             flag = "cut" if hit["applied"] else "keep"
@@ -664,11 +787,27 @@ def format_report(clips: list[dict], cfg: DefillerConfig | None = None) -> str:
                 cut_n += 1
             else:
                 keep_n += 1
+            conf = hit.get("confidence")
+            conf_s = "n/a" if conf is None else f"{conf:.2f}"
+            source = hit.get("source") or "word"
             lines.append(
                 f"  {flag:<4}  {hit['start']:8.3f} – {hit['end']:8.3f}  "
-                f"{hit['text']}  {hit['detail']}"
+                f"{hit['text']}  {source} {conf_s}  {hit['detail']}"
             )
     lines.append(
-        f"defiller: {cut_n} cut, {keep_n} kept, of {cut_n + keep_n} filler-shaped tokens"
+        f"defiller: {cut_n} cut, {keep_n} kept, of {cut_n + keep_n} candidates"
     )
+    note = rows[0].get("audio_note") if rows else None
+    if note:
+        lines.append(note)
     return "\n".join(lines)
+
+
+def format_report(clips: list[dict], cfg: DefillerConfig | None = None,
+                  media: str | None = None) -> str:
+    """Human-readable dry-run. Times are absolute on the source clock.
+
+    Pass `media` (the source video) so gap audio is scanned. Without it the
+    report is word tokens only.
+    """
+    return format_spans(analyze_clips(clips, cfg, media=media))

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,7 @@ except Exception:  # pragma: no cover - depends on env
 
 from .defiller import (
     DefillerConfig,
+    coerce_word,
     plan_defill,
     remap_face_samples,
     shift_point,
@@ -208,6 +210,85 @@ def _output_fps() -> str | None:
     except (TypeError, ValueError):
         return None
     return str(v).rstrip("0").rstrip(".") if 1 <= v <= 120 else None
+
+
+_FPS_TOKEN = re.compile(r"^\d+(?:\.\d+)?(?:/\d+)?$")
+
+
+def _parse_rate(text: str) -> float | None:
+    text = (text or "").strip()
+    if not text or text in ("0/0", "N/A"):
+        return None
+    try:
+        if "/" in text:
+            num, den = text.split("/", 1)
+            den_f = float(den)
+            if den_f == 0:
+                return None
+            return float(num) / den_f
+        return float(text)
+    except ValueError:
+        return None
+
+
+def choose_xfade_fps(r_rate: str | None, avg_rate: str | None,
+                     override: str | None = None) -> str:
+    """Frame-rate token for an `fps` filter placed in front of `xfade`.
+
+    `trim` + `setpts` drops the constant-frame-rate tag. xfade then refuses
+    the pieces ("inputs need constant frame rate") — every cut on 50fps
+    Weekly Sync footage dies there. Forcing `fps` restores a CFR stream.
+
+    An explicit output rate (`SOFIT_FPS` / brand.json, already checked by
+    the caller) wins, so the crossfade matches the `-r` the file is encoded
+    at. A constant-rate source uses `r_frame_rate`. A variable-rate source
+    (the two probed rates disagree) uses `avg_frame_rate` when that average
+    is a real frame rate, otherwise 30.
+    """
+    if override and _FPS_TOKEN.match(str(override).strip()):
+        return str(override).strip()
+
+    def sane(value: float | None) -> bool:
+        return value is not None and 1.0 <= value <= 120.0
+
+    r_s = (r_rate or "").strip()
+    a_s = (avg_rate or "").strip()
+    r = _parse_rate(r_s)
+    avg = _parse_rate(a_s)
+    if sane(r) and sane(avg) and abs(r - avg) <= 0.02 * max(r, avg):
+        return r_s if _FPS_TOKEN.match(r_s) else f"{r:.4f}".rstrip("0").rstrip(".")
+    if sane(avg) and _FPS_TOKEN.match(a_s):
+        return a_s
+    if sane(r) and _FPS_TOKEN.match(r_s):
+        return r_s
+    return "30"
+
+
+def _probe_video_rates(video_path: Path) -> tuple[str | None, str | None]:
+    """(r_frame_rate, avg_frame_rate) as ffprobe printed them, or (None, None)."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+             "-of", "json", str(video_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        streams = json.loads(probe.stdout or "{}").get("streams") or []
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None, None
+    if not streams:
+        return None, None
+    stream = streams[0]
+    return stream.get("r_frame_rate"), stream.get("avg_frame_rate")
+
+
+def constant_fps_for_xfade(video_path: Path) -> str:
+    """Rate string `extract_clip` stamps on each trimmed piece before xfade."""
+    override = _output_fps()
+    if override:
+        return choose_xfade_fps(None, None, override)
+    r_rate, avg_rate = _probe_video_rates(video_path)
+    return choose_xfade_fps(r_rate, avg_rate, None)
 
 
 def _zoom_out_factor() -> float:
@@ -1960,7 +2041,8 @@ def _run_ffmpeg(cmd: list[str]) -> None:
 def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
                        v_in: str = "0:v", a_in: str = "0:a",
                        with_video: bool = True,
-                       edge_fade: float = 0.015) -> tuple[list[str], str | None, str]:
+                       edge_fade: float = 0.015,
+                       fps: str | None = None) -> tuple[list[str], str | None, str]:
     """Trim kept pieces and join them.
 
     `layout` is (source_start, source_end, output_start) from
@@ -1971,16 +2053,25 @@ def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
     A single piece (a filler trimmed off the head or the tail) just trims,
     with a short fade on the cut edge so the join into silence doesn't click.
     Pieces too short to overlap fall back to a hard concat plus edge fades.
+
+    `fps`, when set, is an `fps=` filter on every video piece. trim+setpts
+    strips the CFR tag and xfade errors without it; the value comes from
+    `constant_fps_for_xfade` (source rate, average rate for VFR, or the
+    output override).
     """
+    fps_token = fps if fps and _FPS_TOKEN.match(str(fps).strip()) else None
     parts: list[str] = []
     n = len(layout)
     v_labels: list[str] = []
     a_labels: list[str] = []
     for i, (src_s, src_e, _out) in enumerate(layout):
         if with_video:
-            parts.append(
-                f"[{v_in}]trim=start={src_s:.4f}:end={src_e:.4f},"
-                f"setpts=PTS-STARTPTS[vk{i}]")
+            chain = (f"[{v_in}]trim=start={src_s:.4f}:end={src_e:.4f},"
+                     f"setpts=PTS-STARTPTS")
+            if fps_token:
+                chain += f",fps={fps_token}"
+            chain += f"[vk{i}]"
+            parts.append(chain)
             v_labels.append(f"[vk{i}]")
         dur = max(src_e - src_s, 0.0)
         fd = min(edge_fade, dur / 3.0) if dur else 0.0
@@ -2196,7 +2287,8 @@ def extract_clip(
                 # the logo (applied next, on the cropped frame) follow the
                 # shortened clock the captions were shifted onto.
                 spliced, vlabel, alabel = _splice_av_filters(
-                    layout, used_xf, duration)
+                    layout, used_xf, duration,
+                    fps=constant_fps_for_xfade(source_video))
                 fc_parts.extend(spliced)
                 fc_parts.append(f"[{vlabel}]{vf}[base]")
             else:
@@ -2506,7 +2598,17 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
             # a caption correction, still sees the original tokens.
             cfg = defiller_cfg or DefillerConfig()
             raw_words = list(rng.get("words") or [])
-            plan = (plan_defill(raw_words, max(0.0, end - start), cfg)
+            span_dur = max(0.0, end - start)
+            pcm = None
+            if defiller and raw_words and cfg.audio and source.exists():
+                from .hesitation import has_scannable_gap, read_pcm
+                coerced = [coerce_word(w) for w in raw_words]
+                if has_scannable_gap(coerced, span_dur, cfg.audio_gap):
+                    pcm = read_pcm(source, start, span_dur)
+                    if pcm is None:
+                        print(f"defiller: {clip_id} span {ri} audio scan failed; "
+                              "word fillers only", file=sys.stderr)
+            plan = (plan_defill(raw_words, span_dur, cfg, pcm=pcm)
                     if defiller and raw_words else None)
             cap_words = raw_words
             drops = None
@@ -2514,7 +2616,10 @@ def render_clips(video_path: str, clips: list[dict], out_dir: str,
                 cap_words = plan.words
                 drops = plan.cuts
                 bits = ", ".join(
-                    f"{h.text}@{start + h.start:.2f}s" for h in plan.applied_hits)
+                    f"{h.text}@{start + h.start:.2f}s"
+                    + ("" if h.source == "word" or h.confidence is None
+                       else f" [{h.source} {h.confidence:.2f}]")
+                    for h in plan.applied_hits)
                 print(f"defiller: {clip_id} span {ri} cut "
                       f"{len(plan.applied_hits)} ({bits})", file=sys.stderr)
 

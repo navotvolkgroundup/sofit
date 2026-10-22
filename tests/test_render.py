@@ -611,6 +611,94 @@ def test_splice_filter_renders_a_shorter_clip(tmp_path):
     assert abs(got - out_dur) < 0.15, f"duration {got} vs planned {out_dur}"
 
 
+def test_choose_xfade_fps_uses_source_rate_average_for_vfr_and_override():
+    from sofit.render import choose_xfade_fps
+    assert choose_xfade_fps("50/1", "50/1") == "50/1"
+    # Within 2% the file is CFR; keep the nominal rate, not the average.
+    assert choose_xfade_fps("50/1", "49.5/1") == "50/1"
+    # Trimmed 50fps pieces lose their CFR tag. A variable-rate file is the
+    # same failure with a different number: r_frame_rate is a guess, the
+    # average is what xfade should be forced to.
+    assert choose_xfade_fps("50/1", "2125/49") == "2125/49"
+    assert choose_xfade_fps("90000/1", "30000/1001") == "30000/1001"
+    assert choose_xfade_fps("0/0", "0/0") == "30"
+    assert choose_xfade_fps("50/1", "50/1", override="25") == "25"
+
+
+def test_splice_filter_forces_fps_on_50fps_and_vfr(tmp_path, monkeypatch):
+    """xfade rejects trimmed pieces that lost their constant frame rate.
+
+    50fps Weekly Sync footage hits "xfade: inputs need constant frame rate"
+    after trim+setpts. The graph has to stamp the source rate (or the
+    average, for VFR) onto every piece. An output override wins over both.
+    """
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg")
+    from sofit.defiller import splice_layout
+    from sofit.render import _run_ffmpeg, _splice_av_filters, constant_fps_for_xfade
+
+    src = tmp_path / "src50.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=50:duration=3",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+         "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-video_track_timescale", "90000", "-c:a", "aac",
+         "-y", str(src)],
+        check=True,
+    )
+    rate = constant_fps_for_xfade(src)
+    assert rate == "50/1"
+    layout, out_dur, xf = splice_layout([(0.0, 1.0), (2.0, 3.0)], 0.02)
+    parts, vlabel, alabel = _splice_av_filters(
+        layout, xf, source_duration=3.0, fps=rate)
+    graph = ";".join(parts)
+    assert graph.count(f"fps={rate}") == 2
+    out = tmp_path / "out50.mp4"
+    _run_ffmpeg([
+        "ffmpeg", "-i", str(src), "-filter_complex", graph,
+        "-map", f"[{vlabel}]", "-map", f"[{alabel}]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-y", str(out),
+    ])
+    probed = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, check=True,
+    )
+    got = float(probed.stdout.strip())
+    assert abs(got - out_dur) < 0.15, f"duration {got} vs planned {out_dur}"
+
+    # Dropping every 7th frame makes r_frame_rate and avg_frame_rate disagree.
+    vfr = tmp_path / "vfr.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc=size=320x240:rate=50:duration=2",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+         "-vf", "select='not(eq(mod(n,7),0))',setpts=PTS-STARTPTS",
+         "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest",
+         "-y", str(vfr)],
+        check=True,
+    )
+    vfr_rate = constant_fps_for_xfade(vfr)
+    assert vfr_rate not in ("50/1", "30")
+    layout, out_dur, xf = splice_layout([(0.0, 0.7), (1.2, 1.9)], 0.02)
+    parts, vlabel, alabel = _splice_av_filters(
+        layout, xf, source_duration=2.0, fps=vfr_rate)
+    assert f"fps={vfr_rate}" in ";".join(parts)
+    _run_ffmpeg([
+        "ffmpeg", "-i", str(vfr), "-filter_complex", ";".join(parts),
+        "-map", f"[{vlabel}]", "-map", f"[{alabel}]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-y", str(tmp_path / "out_vfr.mp4"),
+    ])
+
+    monkeypatch.setenv("SOFIT_FPS", "25")
+    assert constant_fps_for_xfade(src) == "25"
+
+
 def test_splice_filter_crossfades_audio_and_video():
     from sofit.defiller import splice_layout
     from sofit.render import _splice_av_filters

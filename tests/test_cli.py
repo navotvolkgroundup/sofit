@@ -154,6 +154,73 @@ def test_defiller_dry_run_reports_without_rendering(monkeypatch, tmp_path, capsy
     assert any(ln.strip().startswith("keep") and "אם" in ln.split() for ln in out.splitlines())
 
 
+def test_defiller_dry_run_reports_an_audio_hum(monkeypatch, tmp_path, capsys):
+    # No filler tokens. The hum is only in the audio, which is the Weekly
+    # Sync case: ivrit-ai writes none of them.
+    import math
+    import struct
+    import wave
+    sr = 8000
+    dur = 2.4
+    samples = [0.0] * int(sr * dur)
+    hum = [0.45 * math.sin(2 * math.pi * 200 * i / sr) for i in range(int(sr * 0.40))]
+    at = int(0.70 * sr)
+    samples[at:at + len(hum)] = hum
+    media = tmp_path / "ep.wav"
+    with wave.open(str(media), "w") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sr)
+        handle.writeframes(b"".join(
+            struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767)) for s in samples))
+    doc = {"schema_version": 1, "source": {"video": str(media)}, "clips": [{
+        "id": "clip-1", "start": 0.0, "end": dur,
+        "words": [
+            {"t": 0.00, "d": 0.30, "w": "שלום"},
+            {"t": 1.70, "d": 0.40, "w": "עולם"},
+        ],
+    }]}
+    p = tmp_path / "clips.json"
+    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    _no_transcribe(monkeypatch)
+    import sofit.render as r
+
+    def boom(*a, **k):
+        raise AssertionError("dry-run must not render")
+    monkeypatch.setattr(r, "render_clips", boom)
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert any(ln.strip().startswith("cut") and "audio" in ln.split()
+               for ln in out.splitlines()), out
+
+
+def test_discourse_flag_is_opt_in(monkeypatch, tmp_path, capsys):
+    doc = {"schema_version": 1, "source": {"video": str(tmp_path / "missing.mp4")},
+           "clips": [{
+               "id": "clip-1", "start": 0.0, "end": 1.5,
+               "words": [
+                   {"t": 0.00, "d": 0.40, "w": "זה"},
+                   {"t": 0.50, "d": 0.35, "w": "כאילו"},
+                   {"t": 1.00, "d": 0.40, "w": "ברור"},
+               ],
+           }]}
+    p = tmp_path / "clips.json"
+    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    _no_transcribe(monkeypatch)
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert not any(ln.strip().startswith("cut") and "כאילו" in ln.split()
+                   for ln in out.splitlines())
+    rc = cli.main(["--render-from", str(p), "--defiller-dry-run",
+                   "--defiller-discourse"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert any(ln.strip().startswith("cut") and "כאילו" in ln.split()
+               for ln in out.splitlines())
+
+
 def test_no_defiller_flag_reaches_render(monkeypatch, tmp_path):
     p = _filler_doc(tmp_path)
     _no_transcribe(monkeypatch)
