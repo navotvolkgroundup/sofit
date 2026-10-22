@@ -45,6 +45,11 @@ def test_render_clips_dry_run_does_not_render(monkeypatch, tmp_path):
     assert res["dry_run"] is True
     assert "אממ" in res["report"]
     assert any(h["text"] == "אממ" and h["applied"] for row in res["spans"] for h in row["hits"])
+    vetoed = m.render_clips(str(f), str(tmp_path / "out"), defiller_dry_run=True,
+                            defiller_skip="0.50")
+    assert vetoed["dry_run"] is True
+    hits = [h for row in vetoed["spans"] for h in row["hits"] if h["text"] == "אממ"]
+    assert hits and hits[0]["applied"] is False and hits[0]["id"] == "0:00.50"
 
 
 def test_render_clips_passes_defiller_flag(monkeypatch, tmp_path):

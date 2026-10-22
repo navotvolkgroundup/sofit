@@ -342,6 +342,53 @@ def _clamp_cut(region: dict, padding: float, min_cut: float,
         region["detail"] += f"; span under {min_cut:.2f}s — left in"
 
 
+# A hum that begins this close to the previous word's estimated end is the
+# tail of that word ("מה…", "לא…"), not a separate hesitation.
+_ELONGATION_SLACK = 0.08
+
+
+def _word_end(word: dict) -> float | None:
+    if "t" in word:
+        return float(word["t"]) + float(word.get("d") or 0.0)
+    if "end" in word:
+        return float(word["end"])
+    return None
+
+
+def _mark_elongations(regions: list[dict], words: list[dict], slack: float,
+                      cut_elongation: bool) -> None:
+    """Reclassify a hum that starts on the previous word's end.
+
+    Proximity to the NEXT word is not this case — that is a hum before
+    speech, and the ordinary hesitation rules still apply. The tail is left
+    in unless `cut_elongation` is set; cutting it tightens comic timing.
+    """
+    ends = [end for end in (_word_end(w) for w in words) if end is not None]
+    if not ends:
+        return
+    for region in regions:
+        if region.get("kind") != "hesitation":
+            continue
+        start = float(region["start"])
+        if not any(abs(start - end) <= slack + 1e-9 for end in ends):
+            continue
+        region["kind"] = "elongation"
+        region["text"] = "elongation"
+        if cut_elongation and region.get("eligible"):
+            region["reason"] = "elongation"
+            region["detail"] = (
+                "drawn-out tail of the previous word, cut because "
+                "elongation is on"
+            )
+        else:
+            region["eligible"] = False
+            region["reason"] = "elongation"
+            region["detail"] = (
+                "drawn-out tail of the previous word — left in "
+                "(opt in to cut these)"
+            )
+
+
 def _separate(regions: list[dict]) -> None:
     """Drop a hum that is glued to speech or laughter in the same gap."""
     blockers = [r for r in regions if r["kind"] in ("speech", "laugh")]
@@ -370,14 +417,15 @@ def _gap_between(a: dict, b: dict) -> float:
 
 def analyze_pcm(samples, sample_rate: int, words: list[dict], duration: float, *,
                 gap: float, padding: float, min_cut: float,
-                min_confidence: float) -> list[dict]:
+                min_confidence: float, cut_elongation: bool = False) -> list[dict]:
     """Classify voiced events inside gaps.
 
     Each dict is a candidate the planner turns into a `FillerHit`:
     start/end are the sound, cut_start/cut_end the padded edit (clamped to
     the gap, so a neighbour word is never eaten), eligible is True only for
     a hesitation that cleared the confidence bar and is not glued to speech
-    or laughter.
+    or laughter. A hum that starts on the previous word's end is an
+    `elongation` and is eligible only when `cut_elongation` is set.
     """
     if not samples or sample_rate <= 0 or duration <= 0:
         return []
@@ -397,6 +445,7 @@ def analyze_pcm(samples, sample_rate: int, words: list[dict], duration: float, *
             region["gap_end"] = g1
             _label(region)
             _clamp_cut(region, padding, min_cut, min_confidence)
+        _mark_elongations(regions, words, _ELONGATION_SLACK, cut_elongation)
         _separate(regions)
         found.extend(regions)
     return found

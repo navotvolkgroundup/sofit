@@ -106,13 +106,22 @@ Present the table; ask which numbers to render. Then build the spec from the pic
     Inside a gap of ≥0.30s, a short steady voiced hum is a hesitation. Only
     that hum is cut, not the pause around it. Laughter, a breath, the other
     host, and a silent dramatic pause stay.
-  `--defiller-dry-run` prints each candidate with its source time, where it
-  came from (`word` or `audio`), and a confidence, and does not render.
-  `--no-defiller` keeps them. `--defiller-min-gap` (default 0.40s) skips a cut
-  that would leave a shorter jump between two removals. `--defiller-discourse`
-  also cuts opt-in words such as כאילו (off by default — כאילו is often a real
-  word); `SOFIT_DISCOURSE_FILLERS` adds more. The MCP `render_clips` tool takes
-  `defiller`, `defiller_dry_run`, `defiller_min_gap`, and `defiller_discourse`.
+  `--defiller-dry-run` prints each candidate with its source time, an `id=`
+  (`15:02.58`), where it came from (`word` or `audio`), and a confidence, and
+  does not render. `--no-defiller` keeps them. `--defiller-min-gap` (default
+  0.40s) skips a cut that would leave a shorter jump between two removals.
+  A cut in the last 0.6s of the clip is left in (it was eating the punchline).
+  A hum that starts where the previous word ends is an `elongation` (מה…, לא…)
+  and stays unless `--defiller-elongation` is set. `--defiller-skip 15:02.58,15:21.24`
+  (or a file of those ids, one per line) vetoes individual cuts.
+  `--defiller-discourse` also cuts opt-in words such as כאילו (off by default —
+  כאילו is often a real word); `SOFIT_DISCOURSE_FILLERS` adds more. The crossfade
+  is aligned to whole frames, so a 25fps render does not stop at the join.
+  The encode length is the post-cut duration: a looped logo was holding the
+  last frame out to the uncut span.
+  The MCP `render_clips` tool takes `defiller`, `defiller_dry_run`,
+  `defiller_min_gap`, `defiller_discourse`, `defiller_elongation`, and
+  `defiller_skip`.
 - Output is `<out_dir>/clip-N.mp4` (ids match the pool numbers). Copy to ~/Downloads as
   `WS<episode>_clip-N.mp4` for the user. This is the ONLY render path that honors caption
   corrections; `--render-clips` on the episode regenerates from the transcript.
@@ -144,7 +153,9 @@ The find matches punctuation/whitespace-insensitively; verify with a rendered fr
 ### 6. Cut a segment out of a clip (post-render trim)
 Hesitations are already removed at render time — both the transcript tokens
 (אממ, um, an isolated אה) and a steady hum the transcriber never wrote down.
-`--defiller-dry-run` lists them with source (`word` or `audio`) and confidence.
+`--defiller-dry-run` lists them with source (`word` or `audio`), confidence,
+and an `id=` you can pass back to `--defiller-skip`. Elongated word tails and
+the last 0.6s of the clip are already left in.
 This step is for a moment the defiller is built to leave in: a gesture, a
 laugh, a breath, the other host, a deliberate pause.
 Not in the spec (a clip is one start/end) — do it on the rendered mp4. Captions/audio/logo

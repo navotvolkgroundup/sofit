@@ -699,6 +699,204 @@ def test_splice_filter_forces_fps_on_50fps_and_vfr(tmp_path, monkeypatch):
     assert constant_fps_for_xfade(src) == "25"
 
 
+def test_splice_clock_puts_a_25fps_crossfade_on_whole_frames():
+    """0.02s at 25fps is half a frame. The dissolve has to be one frame,
+    and the offset has to land on a frame, or xfade ends the picture."""
+    from sofit.defiller import splice_layout
+    from sofit.render import _splice_av_filters, _splice_clock
+
+    layout, _out, xf = splice_layout([(0.0, 8.36), (8.48, 12.0)], 0.02)
+    pieces, fade, expected = _splice_clock(layout, xf, "25")
+    assert fade == pytest.approx(0.04)
+    # 8.36s is 209 frames. The second piece (3.52s) is 88. One-frame overlap.
+    assert pieces[0] == pytest.approx((0.0, 8.36, 0.0))
+    assert pieces[1][2] == pytest.approx(8.32)
+    assert expected == pytest.approx((209 + 88 - 1) / 25)
+    graph = ";".join(_splice_av_filters(layout, xf, 12.0, fps="25")[0])
+    assert "duration=0.040000" in graph
+    assert "offset=8.320000" in graph
+    assert "acrossfade=d=0.040000" in graph
+    assert graph.count("fps=25") == 2
+
+    # A later join is measured on the already-shortened output. Forgetting
+    # the earlier dissolves puts the offset one frame past the picture.
+    many, _out, xf = splice_layout(
+        [(0.0, 4.0), (4.12, 4.40), (4.55, 8.36), (8.48, 12.0)], 0.02)
+    pieces, fade, _expected = _splice_clock(many, xf, "25")
+    assert fade == pytest.approx(0.04)
+    assert [round(p[2], 2) for p in pieces] == [0.0, 3.96, 4.20, 7.96]
+
+    # A piece of a single frame cannot hold a one-frame dissolve.
+    short, _out, xf = splice_layout([(0.0, 0.04), (0.20, 1.0)], 0.02)
+    graph = ";".join(_splice_av_filters(short, xf, 1.0, fps="25")[0])
+    assert "xfade=" not in graph
+    assert "concat=n=2" in graph
+
+
+def test_duration_assertion_names_which_way_the_file_missed():
+    from sofit.render import _duration_mismatch
+    # Video dies at the join; audio and the container run on.
+    short = _duration_mismatch(8.360, 11.860, 11.840, container=11.860)
+    assert short is not None
+    assert "video 8.360s, 3.480s shorter" in short
+    assert "stopped early" in short
+    assert "ran long" not in short
+    # The overlay held the last frame out to the uncut span.
+    long = _duration_mismatch(12.000, 11.520, 11.480, container=12.000)
+    assert long is not None
+    assert "video 12.000s, 0.520s longer" in long
+    assert "ran long" in long
+    assert "stopped early" not in long
+    # Both streams on the frame clock, audio a few tens of ms long (AAC priming).
+    assert _duration_mismatch(11.840, 11.880, 11.840, container=11.880) is None
+    assert _duration_mismatch(None, 11.840, 11.840) is not None
+
+
+def test_splice_at_25fps_keeps_video_through_several_cuts(tmp_path, monkeypatch):
+    """Several joins, including a 0.12s cut, a second cut just after it, and
+    a late cut whose first piece is a whole number of 25fps frames.
+
+    That last shape is the one that truncated real Weekly Sync renders: the
+    video stopped at the join while the audio continued. Both streams have
+    to match the frame clock, and extract_clip checks that itself.
+    """
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg")
+    from sofit.defiller import splice_layout
+    from sofit.render import (
+        _assert_rendered_duration,
+        _run_ffmpeg,
+        _splice_av_filters,
+        _splice_clock,
+        extract_clip,
+    )
+
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+         "testsrc=size=320x240:rate=50:duration=12",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+         "-shortest", "-c:v", "libx264", "-preset", "ultrafast",
+         "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
+         "-c:a", "aac", "-y", str(src)],
+        check=True,
+    )
+    drops = [(4.00, 4.12), (4.40, 4.55), (8.36, 8.48)]
+    from sofit.defiller import keep_intervals
+    keeps = keep_intervals(12.0, drops)
+    layout, _out, xf = splice_layout(keeps, 0.02)
+    _pieces, _fade, expected = _splice_clock(layout, xf, "25")
+    parts, vlabel, alabel = _splice_av_filters(layout, xf, 12.0, fps="25")
+    out = tmp_path / "joined.mp4"
+    _run_ffmpeg([
+        "ffmpeg", "-i", str(src), "-filter_complex", ";".join(parts),
+        "-map", f"[{vlabel}]", "-map", f"[{alabel}]",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-y", str(out),
+    ])
+    _assert_rendered_duration(out, expected)
+
+    monkeypatch.setenv("SOFIT_FPS", "25")
+    delivered = tmp_path / "clip.mp4"
+    extract_clip(
+        src, 0.0, 12.0, delivered, drops=drops, drop_crossfade=0.02,
+        crop_vf="scale=160:160,setsar=1",
+    )
+    _assert_rendered_duration(delivered, expected)
+
+
+def test_cut_render_stays_short_through_logo_and_brand_overlay(tmp_path, monkeypatch):
+    """Full pipeline: word cut, looped corner logo, then the badge/frame pass.
+
+    -t used to be the uncut span. The looped logo held the last frame until
+    that span, so every cut render grew back to the original length and the
+    duration check reported it as ending early. A frame longer than the clip
+    does the same in the brand pass unless that pass stops with the footage.
+    """
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("needs ffmpeg")
+    from PIL import Image
+    from sofit.defiller import DefillerConfig, plan_defill
+    import sofit.render as render_mod
+    from sofit.render import (
+        _apply_brand_overlays,
+        _assert_rendered_duration,
+        _brand_asset,
+        _probe_av_durations,
+        _splice_clock,
+        constant_fps_for_xfade,
+        render_clips,
+    )
+
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+         "testsrc=size=320x240:rate=50:duration=3",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+         "-shortest", "-c:v", "libx264", "-preset", "ultrafast",
+         "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", str(src)],
+        check=True,
+    )
+    logo = tmp_path / "logo.png"
+    badge = tmp_path / "badge.png"
+    Image.new("RGBA", (40, 40), (200, 20, 20, 255)).save(logo)
+    Image.new("RGBA", (80, 24), (20, 20, 200, 255)).save(badge)
+    # Longer than the uncut clip, so a brand pass that follows the frame
+    # instead of the footage pads the file.
+    frame = tmp_path / "frame.mov"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+         "color=c=black:s=80x80:r=25:d=8",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+         "-y", str(frame)],
+        check=True,
+    )
+    words = [
+        {"t": 0.00, "d": 0.40, "w": "שלום"},
+        {"t": 0.90, "d": 0.30, "w": "אממ"},
+        {"t": 1.80, "d": 0.70, "w": "עולם"},
+    ]
+    cfg = DefillerConfig(audio=False)
+    plan = plan_defill(words, 3.0, cfg)
+    assert plan.cuts, "the fixture needs a cut for the overlay to pad against"
+    monkeypatch.setenv("SOFIT_FPS", "25")
+    monkeypatch.setenv("SOFIT_BRAND", "on")
+    monkeypatch.setenv("SOFIT_BADGE", str(badge))
+    monkeypatch.setenv("SOFIT_FRAME", str(frame))
+    # The pipeline scales to the show resolution. The bug is the timeline,
+    # so the test frame stays small.
+    monkeypatch.setattr(
+        "sofit.render._target_resolution", lambda _aspect: (160, 160))
+    assert _brand_asset("SOFIT_FRAME", "frame.mov") == str(frame)
+    assert _brand_asset("SOFIT_BADGE", "badge.png") == str(badge)
+    branded = []
+
+    def _brand(path, width, height):
+        branded.append((width, height))
+        _apply_brand_overlays(path, width, height)
+
+    monkeypatch.setattr(render_mod, "_apply_brand_overlays", _brand)
+
+    fps = constant_fps_for_xfade(src)
+    _pieces, _fade, expected = _splice_clock(plan.layout, plan.crossfade, fps)
+    assert expected < 2.7, expected
+
+    clip = {"id": "clip-1", "start": 0.0, "end": 3.0, "words": words, "focus": 0.5}
+    outs = render_clips(str(src), [clip], str(tmp_path / "out"),
+                        subtitles=False, logo=str(logo), defiller_cfg=cfg)
+    assert branded == [(160, 160)]
+    delivered = outs[0]
+    _assert_rendered_duration(delivered, expected)
+    # Neither the uncut span nor the 8s frame.
+    video, _audio, _box = _probe_av_durations(delivered)
+    assert video < 2.7
+    assert video > expected - 0.1
+
+
 def test_splice_filter_crossfades_audio_and_video():
     from sofit.defiller import splice_layout
     from sofit.render import _splice_av_filters

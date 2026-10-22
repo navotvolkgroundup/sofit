@@ -37,6 +37,19 @@ steady hum (`hesitation.analyze_pcm`). Laughter, breaths, the other host,
 and a silent pause are not cuts. Discourse words such as כאילו are a third
 list, empty unless the caller opts in (`--defiller-discourse` or
 `SOFIT_DISCOURSE_FILLERS`) — כאילו is often a real word.
+
+Three field guards sit on top of that:
+
+* A cut whose padded bounds reach the last `end_guard` seconds of the span
+  (0.6s) is left in. That is the punchline, and a hum there was eating the
+  last word.
+* A hum that starts where the previous word's estimated end is (within
+  0.08s) is the drawn-out tail of that word — "מה…", "לא…". It is reported
+  as `elongation` and left in unless the caller opts in
+  (`--defiller-elongation`). Cutting it tightens comic timing.
+* `--defiller-skip` (a comma-separated list of source times, or a file of
+  them) vetoes individual cuts. The dry run prints `id=15:02.58` on each
+  candidate; that id, `h:mm:ss.ss`, or raw seconds all match.
 """
 
 from __future__ import annotations
@@ -104,16 +117,26 @@ class DefillerConfig:
     audio: bool = True
     audio_gap: float = 0.30
     audio_min_confidence: float = 0.72
+    # A cut that reaches into this tail of the span is left in.
+    end_guard: float = 0.60
+    # Drawn-out tails ("מה…") are reported and, by default, kept.
+    elongation: bool = False
+    # Source-clock times (m:ss.ss, h:mm:ss.ss, or raw seconds) to veto.
+    skip: tuple[str, ...] = ()
 
 
-def config_from_env(min_gap: float | None = None, discourse: bool = False) -> DefillerConfig:
+def config_from_env(min_gap: float | None = None, discourse: bool = False,
+                    elongation: bool = False,
+                    skip: tuple[str, ...] | None = None) -> DefillerConfig:
     """Default config, plus comma-separated extras from the environment.
 
     `SOFIT_FILLERS` appends to the clear list, `SOFIT_SHORT_FILLERS` to the
     ambiguous list. `discourse=True` (the `--defiller-discourse` flag) turns
     on `DISCOURSE_FILLERS`; `SOFIT_DISCOURSE_FILLERS` appends either way, so
-    setting the variable is itself the opt-in. Tests build `DefillerConfig()`
-    directly so they stay hermetic; the CLI and MCP call this.
+    setting the variable is itself the opt-in. `elongation=True` cuts
+    drawn-out word tails. `skip` is the raw tokens from `--defiller-skip`.
+    Tests build `DefillerConfig()` directly so they stay hermetic; the CLI
+    and MCP call this.
     """
     cfg = DefillerConfig()
     extra_clear = _split_env("SOFIT_FILLERS")
@@ -130,7 +153,93 @@ def config_from_env(min_gap: float | None = None, discourse: bool = False) -> De
         cfg = replace(cfg, discourse=disc)
     if min_gap is not None:
         cfg = replace(cfg, min_gap=min_gap)
+    if elongation:
+        cfg = replace(cfg, elongation=True)
+    if skip:
+        cfg = replace(cfg, skip=tuple(skip))
     return cfg
+
+
+def format_clock(seconds: float) -> str:
+    """Source time as `m:ss.ss`, or `h:mm:ss.ss` once an hour is reached.
+
+    Centiseconds, so the string round-trips through `parse_clock` and matches
+    the `id=` a dry run prints (`15:02.58` for 902.58s).
+    """
+    centi = int(round(float(seconds) * 100.0))
+    if centi < 0:
+        centi = 0
+    whole, frac = divmod(centi, 100)
+    hours, rem = divmod(whole, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}.{frac:02d}"
+    return f"{minutes}:{secs:02d}.{frac:02d}"
+
+
+def parse_clock(token: str) -> float:
+    """`15:02.58`, `1:02:03.40`, or raw seconds → seconds.
+
+    One colon is minutes:seconds. Two colons are hours:minutes:seconds.
+    """
+    text = (token or "").strip()
+    if not text:
+        raise ValueError("empty time")
+    parts = text.split(":")
+    if len(parts) == 1:
+        return float(parts[0])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    raise ValueError(f"bad time {token!r}")
+
+
+def load_skip_arg(arg: str | None) -> tuple[str, ...]:
+    """Comma-separated times, or a file with one time per line.
+
+    A path that exists is read as a file: `#` comments are dropped, and a
+    line may still hold several comma-separated times. Anything else is the
+    list itself (`15:02.58,15:21.24`).
+    """
+    if arg is None:
+        return ()
+    text = str(arg).strip()
+    if not text:
+        return ()
+    if os.path.isfile(text):
+        raw = open(text, encoding="utf-8").read()
+        tokens: list[str] = []
+        for line in raw.splitlines():
+            line = line.split("#", 1)[0]
+            for part in line.split(","):
+                part = part.strip()
+                if part:
+                    tokens.append(part)
+        return tuple(tokens)
+    return tuple(part.strip() for part in text.split(",") if part.strip())
+
+
+def _time_skipped(skip: tuple[str, ...], start: float, end: float) -> bool:
+    """True when a skip token falls inside the sound, with 50ms of slack."""
+    if not skip:
+        return False
+    for token in skip:
+        try:
+            t = parse_clock(token)
+        except ValueError:
+            continue
+        if start - 0.05 <= t <= end + 0.05:
+            return True
+    return False
+
+
+def _in_end_guard(bounds: tuple[float, float], duration: float, guard: float) -> bool:
+    """True when the padded cut reaches the last `guard` seconds of the span."""
+    if guard <= 0 or duration <= 0:
+        return False
+    zone = duration - guard
+    return bounds[1] > zone + 1e-4 and bounds[0] < duration - 1e-6
 
 
 def _split_env(name: str) -> tuple[str, ...]:
@@ -501,7 +610,8 @@ def _suppress_short_islands(duration: float, cuts: list[tuple[float, float]],
 
 def plan_defill(words: list[dict], duration: float,
                 cfg: DefillerConfig | None = None,
-                pcm=None, sample_rate: int = 8000) -> DefillPlan:
+                pcm=None, sample_rate: int = 8000,
+                origin: float = 0.0) -> DefillPlan:
     """Plan filler cuts for one span.
 
     `words` are clip-relative ({t, d, w}) or transcript-shaped ({start, end,
@@ -513,6 +623,10 @@ def plan_defill(words: list[dict], duration: float,
     config's audio scan is on, voiced hums inside gaps join the same cut
     list as the word fillers, so min_gap, the crossfade, and the caption
     shift apply to both.
+
+    `origin` is the span's start on the source clock. Skip-list times are
+    absolute (the `id=` a dry run prints), so a span that does not start at
+    zero still matches them.
     """
     cfg = cfg or DefillerConfig()
     src = [coerce_word(w) for w in words]
@@ -558,7 +672,19 @@ def plan_defill(words: list[dict], duration: float,
             reason = "too_short"
             detail = f"filler span under {cfg.min_cut:.2f}s — left in"
             bounds = None
-        if bounds is not None:
+        if bounds is not None and _in_end_guard(bounds, duration, cfg.end_guard):
+            eligible = False
+            reason = "end_guard"
+            detail = (
+                f"left in; the cut sits within {cfg.end_guard:.2f}s of the clip end"
+            )
+        elif bounds is not None and _time_skipped(
+                cfg.skip, origin + word["t"],
+                origin + word["t"] + max(word["d"], 0.0)):
+            eligible = False
+            reason = "skip"
+            detail = "left in; this cut is on the skip list"
+        if bounds is not None and eligible:
             raw_cuts.append(bounds)
         detected.append({
             "index": i,
@@ -576,10 +702,27 @@ def plan_defill(words: list[dict], duration: float,
             pcm, sample_rate, src, duration,
             gap=cfg.audio_gap, padding=cfg.padding, min_cut=cfg.min_cut,
             min_confidence=cfg.audio_min_confidence,
+            cut_elongation=cfg.elongation,
         )
         for region in audio_regions:
-            if region.get("eligible") and region.get("cut_end", 0) > region.get("cut_start", 0):
-                raw_cuts.append((region["cut_start"], region["cut_end"]))
+            cut = (float(region.get("cut_start") or 0.0),
+                   float(region.get("cut_end") or 0.0))
+            if not (region.get("eligible") and cut[1] > cut[0]):
+                continue
+            if _in_end_guard(cut, duration, cfg.end_guard):
+                region["eligible"] = False
+                region["reason"] = "end_guard"
+                region["detail"] += (
+                    f"; left in — within {cfg.end_guard:.2f}s of the clip end"
+                )
+                continue
+            if _time_skipped(cfg.skip, origin + float(region["start"]),
+                             origin + float(region["end"])):
+                region["eligible"] = False
+                region["reason"] = "skip"
+                region["detail"] += "; left in — this cut is on the skip list"
+                continue
+            raw_cuts.append(cut)
 
     cuts = merge_cuts(raw_cuts)
     cuts = _absorb_silence(duration, cuts, src, cfg.min_gap)
@@ -731,13 +874,15 @@ def analyze_clips(clips: list[dict], cfg: DefillerConfig | None = None,
                     if pcm is None:
                         failed = True
                         note = "audio scan skipped: could not read source audio"
-            plan = plan_defill(words, dur, cfg, pcm=pcm)
+            plan = plan_defill(words, dur, cfg, pcm=pcm, origin=start)
             hits = []
             for hit in plan.hits:
+                abs_start = round(start + hit.start, 3)
                 hits.append({
                     "text": hit.text,
-                    "start": round(start + hit.start, 3),
+                    "start": abs_start,
                     "end": round(start + hit.end, 3),
+                    "id": format_clock(abs_start),
                     "applied": hit.applied,
                     "reason": hit.reason,
                     "detail": hit.detail,
@@ -790,9 +935,12 @@ def format_spans(rows: list[dict]) -> str:
             conf = hit.get("confidence")
             conf_s = "n/a" if conf is None else f"{conf:.2f}"
             source = hit.get("source") or "word"
+            hit_id = hit.get("id") or format_clock(hit["start"])
+            # id= sits after the confidence so the start/end columns stay put
+            # (a dry-run line's second and fourth fields are those times).
             lines.append(
                 f"  {flag:<4}  {hit['start']:8.3f} – {hit['end']:8.3f}  "
-                f"{hit['text']}  {source} {conf_s}  {hit['detail']}"
+                f"{hit['text']}  {source} {conf_s}  id={hit_id}  {hit['detail']}"
             )
     lines.append(
         f"defiller: {cut_n} cut, {keep_n} kept, of {cut_n + keep_n} candidates"

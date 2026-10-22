@@ -13,9 +13,11 @@ Hesitations are not this skill. Render already cuts them: transcript tokens
 or low-confidence אה / אם — "if" stays when it is just the word in a sentence)
 and a steady hum found in the audio of a gap, which is the usual case because
 ivrit-ai never writes אממ. `--defiller-dry-run` lists each cut with `word` or
-`audio` and a confidence; `--no-defiller` keeps the ums. Use sofit-trim for a
-moment the defiller leaves in — a gesture, a nose-touch, a laugh, a breath,
-the other host, a false start.
+`audio`, a confidence, and an `id=`. `--defiller-skip` takes those ids (or a
+file of them) to veto a cut; `--defiller-elongation` opts in to drawn-out
+word tails, which are otherwise kept; the last 0.6s of a clip is never cut.
+`--no-defiller` keeps the ums. Use sofit-trim for a moment the defiller leaves
+in — a gesture, a nose-touch, a laugh, a breath, the other host, a false start.
 
 ## Find the exact window first
 Extract frames around the moment and look, so START/END are precise:
