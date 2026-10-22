@@ -455,3 +455,25 @@ def test_prompts_follow_episode_language(monkeypatch):
     monkeypatch.delenv("SOFIT_LANG")
     make_chapters(SEGMENTS, titler="claude-cli")
     assert "Hebrew" in seen[0]  # default stays Hebrew
+
+
+def test_brand_rule_drops_out_in_another_language(monkeypatch):
+    # The brand rule fixes the Hebrew spelling of the show's name. Substituting
+    # the language into it produced "write the show's name in English as
+    # 'וויקלי סינק'", which forces Hebrew into an English episode.
+    seen = []
+
+    def fake_cli(system, user, model):
+        seen.append(system)
+        return json.dumps([{"title": "Intro", "quote": "שלום וברוכים הבאים"}],
+                          ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_claude_cli", fake_cli)
+    monkeypatch.setenv("SOFIT_LANG", "en")
+    make_chapters(SEGMENTS, titler="claude-cli")
+    assert "וויקלי סינק" not in seen[0] and "Weekly Sync" not in seen[0]
+
+    seen.clear()
+    monkeypatch.setenv("SOFIT_LANG", "he")
+    make_chapters(SEGMENTS, titler="claude-cli")
+    assert gen.BRAND_RULE in seen[0]  # Hebrew keeps it

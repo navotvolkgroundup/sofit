@@ -265,8 +265,12 @@ def call_claude_json(system: str, user: str, validate, model: str | None = None,
     """
     model = model or os.environ.get("SOFIT_TITLER_MODEL") or CLAUDE_MODEL
     # Prompts are written for Hebrew; SOFIT_LANG (set by --lang) swaps in the
-    # episode language at the one place every generator routes through.
-    system = system.replace("Hebrew", languages.name(os.environ.get("SOFIT_LANG", languages.DEFAULT_LANG)))
+    # episode language at the one place every generator routes through. The brand
+    # rule is a Hebrew-spelling rule, so it drops out entirely in another language
+    # rather than becoming "write the show's name in English as 'וויקלי סינק'".
+    lang = os.environ.get("SOFIT_LANG", languages.DEFAULT_LANG)
+    if lang != languages.DEFAULT_LANG:
+        system = system.replace(BRAND_RULE, "").replace("Hebrew", languages.name(lang))
     transport = _call_claude_cli if titler == "claude-cli" else _call_api
     last_err: Exception | None = None
     for _ in range(2):
