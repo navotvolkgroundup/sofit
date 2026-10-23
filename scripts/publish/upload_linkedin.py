@@ -15,11 +15,17 @@ also not the same as attaching it; the media editor's "Next" is what commits.
 Composer map (probed 2026-09-25): text is the first `.ql-editor`, the media
 button is aria-label "Add media", scheduling is aria-label "Schedule post", and
 `input[type=file]` only exists AFTER the media button is clicked.
+
+A schedule counts as set only when the composer line reads
+"Posting <Ddd>, <Mon> <d> at <h:mm AM/PM>". `--dry` still does not post;
+`--submit` is refused when that line is missing or the primary button
+still says Post.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import sys
 from pathlib import Path
@@ -37,6 +43,44 @@ def _cfg() -> dict:
 
 CLIPS_DIR = Path(_cfg().get("clips_dir", "~/Downloads")).expanduser()
 ADMIN = "https://www.linkedin.com/company/{cid}/admin/dashboard/"
+
+# The composer is English. strftime('%a')/'%b' follow the process locale.
+_EN_WEEKDAY = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_EN_MONTH = (
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+def linkedin_time_label(time_local: str) -> str:
+    """'20:00' -> '8:00 PM', the 12-hour string the schedule box displays."""
+    hour, minute = (int(part) for part in time_local.split(":"))
+    return f"{hour % 12 or 12}:{minute:02d} {'PM' if hour >= 12 else 'AM'}"
+
+
+def linkedin_posting_line(date_iso: str, time_local: str) -> str:
+    """Composer readback, e.g. 'Posting Sun, Nov 1 at 8:00 PM'."""
+    day = datetime.date.fromisoformat(date_iso)
+    return (f"Posting {_EN_WEEKDAY[day.weekday()]}, {_EN_MONTH[day.month]} "
+            f"{day.day} at {linkedin_time_label(time_local)}")
+
+
+def linkedin_schedule_matches(got_line: str, date_iso: str, time_local: str) -> bool:
+    return " ".join((got_line or "").split()) == linkedin_posting_line(date_iso, time_local)
+
+
+def linkedin_stop(*, dry: bool, scheduled: bool,
+                  primary: str | None) -> tuple[str, int] | None:
+    """(status, exit code) when the run must stop, else None to click the button.
+
+    --dry never posts. A schedule that did not stick, or a primary button that
+    still says Post, is refused: that click would publish immediately.
+    """
+    if dry:
+        return ("dry_ok" if scheduled else "dry_schedule_failed"), 0
+    if not scheduled or (primary or "").lower().startswith("post"):
+        return "refused_would_post_now", 4
+    return None
 
 
 def main() -> int:
@@ -82,6 +126,13 @@ def main() -> int:
             ctx.close()
             return 2
 
+        # 2026-10-22: a "Premium Company Page" upsell modal covers the dashboard - dismiss it.
+        for sel in ("button[aria-label='Dismiss']", "[role=dialog] button[aria-label*='Close']", "button:has-text('Not now')"):
+            try:
+                page.locator(sel).first.click(timeout=3_000); page.wait_for_timeout(1_500); break
+            except Exception:  # noqa: BLE001
+                continue
+        page.keyboard.press("Escape"); page.wait_for_timeout(1_000)
         page.locator("button:has-text('Create')").first.click(timeout=15_000)
         page.wait_for_timeout(2_000)
         page.locator("text=Start a post").first.click(timeout=15_000)
@@ -119,16 +170,48 @@ def main() -> int:
             d, mo, y = post["date"].split("-")[::-1]
             page.fill("input[name='date'], input[id*='date']", f"{mo}/{d}/{y}")
             page.wait_for_timeout(500)
-            page.fill("input[name='time'], input[id*='time']", plan["time_local"])
-            page.wait_for_timeout(500)
-            page.locator("[role=dialog] button:has-text('Next')").last.click(timeout=8_000)
+            # 2026-10-22: page.fill() on the time box showed "8:00 PM" in the
+            # dialog but the composer then said "Posting ... at 5:15 PM" - the
+            # value never reached the component state. TYPE it (12h, the
+            # format the box displays), pick the matching dropdown option if
+            # one shows, commit with Tab, and read the composer back below.
+            want_t = linkedin_time_label(plan["time_local"])
+            t_in = page.locator("[role=dialog] input[name='time'], [role=dialog] input[id*='time']").first
+            for _try in range(3):
+                t_in.click(timeout=8_000)
+                page.keyboard.press("Control+A"); page.keyboard.press("Backspace")
+                page.keyboard.type(want_t, delay=60)
+                page.wait_for_timeout(900)
+                opt = page.locator("[role=dialog] [role=option], [role=listbox] li, .artdeco-typeahead__result")
+                picked = False
+                for i in range(min(opt.count(), 120)):
+                    o = opt.nth(i)
+                    try:
+                        if o.is_visible() and o.inner_text().strip() == want_t:
+                            o.click(timeout=3_000); picked = True; break
+                    except Exception:  # noqa: BLE001
+                        pass
+                if not picked:
+                    page.keyboard.press("Enter")
+                page.keyboard.press("Tab")
+                page.wait_for_timeout(700)
+                if t_in.input_value().strip().upper() == want_t:
+                    break
+            print(f"info: time box reads {t_in.input_value()!r} (picked={picked})", file=sys.stderr)
+            page.evaluate("""() => { const b=[...document.querySelectorAll('[role=dialog] button')].filter(x=>x.innerText.trim()==='Next' && x.offsetParent!==null); if(b.length) b[b.length-1].click(); }""")
             page.wait_for_timeout(4_000)
             # Back in the composer, or the readbacks below measure nothing.
             if page.locator("[role=dialog] input[id*='date']").count():
                 raise RuntimeError("schedule dialog still open after Next")
+            # Ground truth is the composer line, e.g. "Posting Sun, Nov 1 at 8:00 PM".
+            want_line = linkedin_posting_line(post["date"], plan["time_local"])
+            got_line = page.evaluate(r"""() => { const m=(document.querySelector('[role=dialog]')||document.body).innerText.match(/Posting [A-Z][a-z]{2}, [A-Z][a-z]{2} \d{1,2} at \d{1,2}:\d{2}\s?[AP]M/); return m?m[0].replace(/\s+/g,' '):''; }""")
+            print(f"info: composer says {got_line!r}", file=sys.stderr)
+            if not linkedin_schedule_matches(got_line, post["date"], plan["time_local"]):
+                raise RuntimeError(f"schedule readback mismatch: want {want_line!r} got {got_line!r}")
             scheduled = True
         except Exception as e:  # noqa: BLE001
-            print(f"warn: scheduling failed ({str(e)[:90]})", file=sys.stderr)
+            print(f"warn: scheduling failed ({str(e)[:180]})", file=sys.stderr)
 
         # What the primary button says is the ground truth for what a click
         # would do. Read it back rather than assuming the schedule took.
@@ -140,23 +223,18 @@ def main() -> int:
             "[role=dialog] [class*=video-preview], [role=dialog] img[src^=blob]')")
         page.screenshot(path=args.shot, full_page=False)
 
-        state = {"clip": args.clip, "date": post["date"],
+        posting_line = page.evaluate(r"""() => { const m=(document.querySelector('[role=dialog]')||document.body).innerText.match(/Posting [^\n]*? at \d{1,2}:\d{2}\s?[AP]M/); return m?m[0]:''; }""")
+        state = {"clip": args.clip, "date": post["date"], "posting_line": posting_line,
                  "time": plan["time_local"], "scheduled": scheduled,
                  "primary_button": primary, "video_attached": has_video,
                  "chars": len(text), "screenshot": args.shot}
 
-        if args.dry:
-            print(json.dumps({"status": "dry_ok", **state}, ensure_ascii=False))
+        stop = linkedin_stop(dry=args.dry, scheduled=scheduled, primary=primary)
+        if stop is not None:
+            status, code = stop
+            print(json.dumps({"status": status, **state}, ensure_ascii=False))
             ctx.close()
-            return 0
-
-        # Refuse to publish immediately when a schedule was asked for: a primary
-        # button still reading "Post" means the schedule did not stick.
-        if not scheduled or (primary or "").lower().startswith("post"):
-            print(json.dumps({"status": "refused_would_post_now", **state},
-                             ensure_ascii=False))
-            ctx.close()
-            return 4
+            return code
 
         page.locator(".share-actions__primary-action").first.click(timeout=10_000)
         page.wait_for_timeout(6_000)
