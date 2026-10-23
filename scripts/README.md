@@ -9,7 +9,13 @@
   performance log at ~/.sofit/performance.jsonl), and a WhatsApp digest.
   `--dry` fills the form and screenshots without posting; only `--submit`
   posts. TikTok picks Asia/Jerusalem and refuses to submit unless the
-  upload finished and the date, time, and zone read back. Instagram skips
+  upload finished, the date, time, and zone read back, every planned
+  hashtag committed, and the caption body is in the editor. The footer
+  Schedule button is matched by its visible text when the content check
+  has not exposed the accessible name, and the scheduled list is checked
+  for the expected date afterwards. Chrome's `--disable-quic` flag (on
+  unless `SOFIT_TT_NOQUIC=0`) is a modest help for "Couldn't upload"
+  failures, about 31% to 42% success per attempt, not a fix. Instagram skips
   disabled days from the adjacent month; `--trial` exits unless the Trial
   Reel toggle reads back on. LinkedIn types the time, picks the matching
   dropdown option, and checks the composer "Posting … at" line.
