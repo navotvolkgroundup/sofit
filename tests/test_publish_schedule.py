@@ -156,6 +156,103 @@ def test_linkedin_dry_does_not_post_and_a_post_button_is_refused():
         "refused_would_post_now", 4)
 
 
+def test_disable_quic_is_on_unless_turned_off():
+    base = ["--disable-blink-features=AutomationControlled"]
+    assert tt.chrome_launch_args({}) == base + ["--disable-quic"]
+    assert tt.chrome_launch_args({"SOFIT_TT_NOQUIC": "1"}) == base + ["--disable-quic"]
+    assert tt.chrome_launch_args({"SOFIT_TT_NOQUIC": "0"}) == base
+    assert tt.chrome_launch_args({"SOFIT_TT_NOQUIC": ""}) == base
+    src = (_PUBLISH / "upload_tiktok.py").read_text(encoding="utf-8")
+    assert "modest help" in src
+    assert "not a fix" in src
+    assert "31%" in src and "42%" in src
+
+
+def test_submit_refuses_missing_tags_or_caption_body():
+    assert tt.tiktok_submit_block(
+        n_tags=2, n_want=2, body="the episode line",
+        editor_text="the episode line\n\n#one", missed=[]) is None
+    blocked = tt.tiktok_submit_block(
+        n_tags=1, n_want=3, body="the episode line",
+        editor_text="the episode line", missed=["#two", "#three"])
+    assert blocked == {
+        "status": "refused_tags",
+        "tags_registered": 1,
+        "tags_wanted": 3,
+        "tags_missed": ["#two", "#three"],
+    }
+    # Tags win when both are wrong: nothing is submitted either way.
+    blocked = tt.tiktok_submit_block(
+        n_tags=0, n_want=1, body="the episode line", editor_text="",
+        missed=["#one"])
+    assert blocked["status"] == "refused_tags"
+    assert tt.tiktok_submit_block(
+        n_tags=1, n_want=1, body="the episode line",
+        editor_text="#one only") == {"status": "refused_body_mismatch"}
+    # Bidi marks in the plan still count as the same caption.
+    assert tt.tiktok_submit_block(
+        n_tags=0, n_want=0, body="אחד\u200f שניים",
+        editor_text="אחד שניים\nmore") is None
+
+
+def test_footer_schedule_uses_visible_text_then_the_accessible_name():
+    assert tt.footer_schedule_via(1) == "text"
+    assert tt.footer_schedule_via(2) == "text"
+    assert tt.footer_schedule_via(0) == "role"
+    assert tt.footer_schedule_ready(1, True)
+    assert not tt.footer_schedule_ready(0, True)
+    assert not tt.footer_schedule_ready(2, True)
+    assert not tt.footer_schedule_ready(1, False)
+    src = (_PUBLISH / "upload_tiktok.py").read_text(encoding="utf-8")
+    text_at = src.index("has_text=_SCHEDULE_BUTTON_TEXT")
+    role_at = src.index('get_by_role("button", name="Schedule", exact=True)')
+    assert text_at < role_at
+    assert "schedule_container" in src
+    assert "refused_schedule_button" in src
+
+
+def test_list_stamp_stays_english_when_the_locale_changes():
+    import locale
+    assert tt.tiktok_list_stamp("2026-10-27", "20:00") == "Oct 27, 8:00 PM"
+    assert tt.tiktok_list_stamp("2026-11-01", "08:05") == "Nov 1, 8:05 AM"
+    assert tt.tiktok_list_stamp("2026-11-01", "00:00") == "Nov 1, 12:00 AM"
+    assert tt.tiktok_list_stamp("2026-11-01", "12:00") == "Nov 1, 12:00 PM"
+    assert tt.tiktok_list_stamp("2026-01-05", "13:15") == "Jan 5, 1:15 PM"
+    assert tt.tiktok_list_stamp("2026-12-31", "23:59") == "Dec 31, 11:59 PM"
+    saved = locale.setlocale(locale.LC_TIME)
+    try:
+        tried = 0
+        for name in ("C", "de_DE.UTF-8", "he_IL.UTF-8", "fr_FR.UTF-8"):
+            try:
+                locale.setlocale(locale.LC_TIME, name)
+            except locale.Error:
+                continue
+            tried += 1
+            assert tt.tiktok_list_stamp("2026-10-27", "20:00") == "Oct 27, 8:00 PM"
+        assert tried >= 1
+    finally:
+        locale.setlocale(locale.LC_TIME, saved)
+    assert tt.tiktok_list_row_has_stamp(
+        "clip caption\nOct 27, 8:00 PM\nScheduled", "2026-10-27", "20:00")
+    assert tt.tiktok_list_row_has_stamp(
+        "clip \u200eOct  27,  8:00 PM", "2026-10-27", "20:00")
+    assert not tt.tiktok_list_row_has_stamp(
+        "clip caption\nOct 28, 8:00 PM", "2026-10-27", "20:00")
+    assert not tt.tiktok_list_row_has_stamp("", "2026-10-27", "20:00")
+    assert tt.tiktok_submit_status(True, True) == "submitted"
+    assert tt.tiktok_submit_status(True, False) == "submitted_unverified"
+    assert tt.tiktok_submit_status(False, True) == "submitted_unverified"
+    assert tt.tiktok_submit_status(False, False) == "submitted_unverified"
+    src = (_PUBLISH / "upload_tiktok.py").read_text(encoding="utf-8")
+    assert "import calendar" not in src
+    body = src.split("def tiktok_list_stamp", 1)[1].split(
+        "def tiktok_list_row_has_stamp", 1)[0]
+    code = body.split('"""', 2)[-1]
+    assert "strftime" not in code
+    assert "calendar" not in code
+    assert "_EN_MONTH_ABBR" in body
+
+
 def test_trial_must_read_back_on_before_share():
     assert not ig.trial_unavailable(False, None)
     assert not ig.trial_unavailable(True, "true")

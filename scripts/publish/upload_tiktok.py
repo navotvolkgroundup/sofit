@@ -7,7 +7,15 @@ confirmation screenshot and exits WITHOUT posting. Only `--submit` clicks the
 Schedule button - the human-confirm gate is the design, not a courtesy.
 In `--dry` every Schedule/Post button is disabled in the page. Scheduling
 picks Asia/Jerusalem, then the date and time, and stops if that readback
-disagrees. `--submit` is refused unless the video upload has finished.
+disagrees. `--submit` is refused unless the video upload has finished, every
+planned hashtag committed, and the caption body is in the editor. The footer
+Schedule button is found by its visible text when the content check has not
+exposed the accessible name "Schedule". After scheduling, the content list
+must show the expected date.
+
+Chrome's `--disable-quic` flag is on unless `SOFIT_TT_NOQUIC=0`. It is a
+modest help for "Couldn't upload" failures (about 31% to 42% success per
+attempt), not a fix.
 
     upload_tiktok.py --clip clip-12 --plan publish-plan.json --dry
     upload_tiktok.py --clip clip-12 --plan publish-plan.json --submit
@@ -58,6 +66,9 @@ _EN_MONTH_ABBR = (
 )
 _MENTION = re.compile(r"(?<![\w.@])@([A-Za-z0-9_.]{2,24}[A-Za-z0-9_])")
 _BIDI = re.compile("[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
+# Exact visible label of the footer submit button. Anchored so a longer
+# label (the schedule radio's container, a tour step) does not match.
+_SCHEDULE_BUTTON_TEXT = re.compile(r"^\s*Schedule\s*$")
 
 
 def split_tags(caption: str) -> tuple[str, list[str]]:
@@ -153,6 +164,81 @@ def tiktok_dry_or_refuse(*, dry: bool, upload_broken: bool,
     return None
 
 
+def chrome_launch_args(environ: dict[str, str] | None = None) -> list[str]:
+    """Chrome flags for the persistent upload context.
+
+    ``--disable-quic`` is on unless ``SOFIT_TT_NOQUIC`` is set to a value
+    other than ``1``. It is a modest help for TikTok's "Couldn't upload"
+    chunk failures (about 31% to 42% success per attempt), not a fix.
+    """
+    env = os.environ if environ is None else environ
+    args = ["--disable-blink-features=AutomationControlled"]
+    if env.get("SOFIT_TT_NOQUIC", "1") == "1":
+        args.append("--disable-quic")
+    return args
+
+
+def tiktok_submit_block(*, n_tags: int, n_want: int, body: str,
+                        editor_text: str,
+                        missed: list[str] | None = None) -> dict | None:
+    """Refuse a submit whose hashtags or caption body did not land.
+
+    Every planned hashtag has to have committed, and the full body
+    (including the episode line) has to be in the editor. Returns a status
+    payload, or None when both checks pass and the click may proceed.
+    """
+    if n_tags < n_want:
+        return {
+            "status": "refused_tags",
+            "tags_registered": n_tags,
+            "tags_wanted": n_want,
+            "tags_missed": list(missed or []),
+        }
+    if not body_in_editor(body, editor_text):
+        return {"status": "refused_body_mismatch"}
+    return None
+
+
+def footer_schedule_via(text_visible: int) -> str:
+    """'text' when a Schedule button is visible by its label, else 'role'.
+
+    While "Content check lite" is running, the footer button is not exposed
+    under the accessible name "Schedule", so the visible-text lookup is what
+    finds it. The accessible-name lookup is the fallback when that text
+    match is not on screen.
+    """
+    return "text" if text_visible else "role"
+
+
+def footer_schedule_ready(visible: int, enabled: bool) -> bool:
+    """The submit click needs exactly one visible, enabled Schedule button."""
+    return visible == 1 and enabled
+
+
+def tiktok_list_stamp(date_iso: str, time_local: str) -> str:
+    """Scheduled-list stamp, e.g. 'Oct 27, 8:00 PM'.
+
+    English month abbreviations and AM/PM. ``calendar.month_abbr`` and
+    ``strftime`` follow the process locale and would miss the row on a
+    machine that is not set to English.
+    """
+    _year_s, month_s, day_s = date_iso.split("-")
+    month, day = int(month_s), int(day_s)
+    hour, minute = (int(part) for part in time_local.split(":"))
+    return (f"{_EN_MONTH_ABBR[month]} {day}, "
+            f"{hour % 12 or 12}:{minute:02d} {'PM' if hour >= 12 else 'AM'}")
+
+
+def tiktok_list_row_has_stamp(row_text: str, date_iso: str, time_local: str) -> bool:
+    """The content-list row text includes the expected scheduled stamp."""
+    return tiktok_list_stamp(date_iso, time_local) in strip_bidi(row_text)
+
+
+def tiktok_submit_status(row_ok: bool, row_date_ok: bool) -> str:
+    """Confirmed only when the content list shows this clip on the planned date."""
+    return "submitted" if row_ok and row_date_ok else "submitted_unverified"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", required=True)
@@ -179,7 +265,7 @@ def main() -> int:
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
             str(PROFILE), headless=True, channel="chrome",
-            args=["--disable-blink-features=AutomationControlled"],
+            args=chrome_launch_args(),
             viewport={"width": 1500, "height": 1000})
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -506,9 +592,10 @@ def main() -> int:
             print(f"mentions linked: {' '.join('@' + h for h in got_mentions)}",
                   file=sys.stderr)
 
-        # Report, don't fail on it: a caption with dead hashtags is still worth
-        # posting, but we want to SEE it rather than find out months later.
-        # NOTE this counts suggestion-panel picks, not a readback - the composer
+        # Dry runs report a short hashtag count and continue, so the form can
+        # still be reviewed. --submit refuses (tiktok_submit_block) when any
+        # planned tag is missing or the caption body is not in the editor.
+        # This count is suggestion-panel picks, not a readback - the composer
         # gives no signal. Confirm on the LIVE post (its tags should be
         # <a href="/tag/...">), not from a dry run.
         n_want = len(split_tags(post["tiktok"])[1])
@@ -757,14 +844,52 @@ def main() -> int:
             ctx.close()
             print(json.dumps({"status": gate[0], "clip": args.clip}))
             return gate[1]
+        # 2026-10-23 pre-submit gates: every planned hashtag committed, the
+        # full body (incl. the episode line) present, and exactly ONE enabled
+        # footer Schedule button. Any miss = refuse, nothing is submitted.
+        blocked = tiktok_submit_block(
+            n_tags=n_tags, n_want=n_want,
+            body=split_tags(post["tiktok"])[0],
+            editor_text=cap.inner_text(), missed=missed)
+        if blocked is not None:
+            page.screenshot(path=args.shot.replace(".png", "-refused.png"))
+            ctx.close()
+            print(json.dumps({**blocked, "clip": args.clip}, ensure_ascii=False))
+            return 7
         purge_tour()
-        page.get_by_role("button", name="Schedule").click(force=True)
+        # By visible TEXT, outside the schedule settings box: while "Content
+        # check lite" is still running the footer button is not exposed under
+        # the accessible name "Schedule" (clip-11/clip-4, 2026-10-23).
+        _all = page.locator("button").filter(has_text=_SCHEDULE_BUTTON_TEXT).filter(
+            has_not=page.locator("[data-e2e=schedule_container]"))
+        _text_visible = sum(
+            1 for i in range(_all.count()) if _all.nth(i).is_visible())
+        if footer_schedule_via(_text_visible) == "role":
+            _all = page.get_by_role("button", name="Schedule", exact=True)
+        print("info: footer Schedule buttons:", _all.count(), file=sys.stderr)
+        _vis = [_all.nth(i) for i in range(_all.count()) if _all.nth(i).is_visible()]
+        _n_all = _all.count()
+        _enabled = len(_vis) == 1 and _vis[0].is_enabled()
+        if not footer_schedule_ready(len(_vis), _enabled):
+            page.screenshot(path=args.shot.replace(".png", "-refused.png"))
+            ctx.close()
+            print(json.dumps({"status": "refused_schedule_button", "clip": args.clip,
+                              "visible": len(_vis), "total": _n_all}))
+            return 7
+        _vis[0].click()
         page.wait_for_timeout(4_000)
         # "We're still checking your video... continue?" - confirm; the
         # content check keeps running server-side after scheduling.
         try:
             pn = page.get_by_role("button", name="Post now")
             if pn.count():
+                try:
+                    print("info: confirm dialog:", page.evaluate(
+                        "()=>[...document.querySelectorAll('[role=dialog]')]"
+                        ".map(d=>d.innerText.slice(0,300)).join(' || ')"),
+                          file=sys.stderr)
+                except Exception:  # noqa: BLE001
+                    pass
                 pn.first.click(timeout=4_000)
         except Exception:  # noqa: BLE001
             pass
@@ -809,6 +934,21 @@ def main() -> int:
             page.reload(wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_timeout(5_000)
         row_ok = bool(post_url)
+        # The row has to show the date we scheduled, in the studio's English
+        # stamp ("Oct 27, 8:00 PM"). A caption match on the wrong day is not
+        # a confirmed schedule.
+        want_row = tiktok_list_stamp(post["date"], plan["time_local"])
+        row_txt = page.evaluate("""(head) => {
+              const norm = s => (s || "").replace(/[\\u200e\\u200f\\u061c\\u202a-\\u202e\\u2066-\\u2069]/g, "").replace(/\\s+/g, " ").trim();
+              const want = norm(head);
+              for (const a of document.querySelectorAll("a[href*='/video/']")) {
+                let r=a; for (let i=0;i<8&&r;i++){ r=r.parentElement;
+                  if (r && /\\b[A-Z][a-z]{2} \\d{1,2}, \\d{1,2}:\\d{2} [AP]M/.test(r.innerText||"")) break; }
+                if (r && norm(r.innerText).includes(want)) return norm(r.innerText);
+              }
+              return ""; }""", url_needle)
+        row_date_ok = tiktok_list_row_has_stamp(
+            row_txt, post["date"], plan["time_local"])
         # NO first-row fallback. It used to take a[href*='/video/'] .first when
         # the caption match failed, and the list is sorted by SCHEDULED date, so
         # that returned a DIFFERENT clip's URL - the pins re-upload came back
@@ -820,7 +960,8 @@ def main() -> int:
         if post_url.startswith("/"):
             post_url = "https://www.tiktok.com" + post_url
         import autolog
-        out = {"status": "submitted" if row_ok else "submitted_unverified",
+        out = {"status": tiktok_submit_status(row_ok, row_date_ok),
+               "row_date_want": want_row, "row_date_ok": row_date_ok,
                "clip": args.clip, "date": post["date"], "post_url": post_url,
                "tags_registered": n_tags, "tags_wanted": n_want}
         if missed:
