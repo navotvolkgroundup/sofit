@@ -362,6 +362,26 @@ def _rank(rows, platform):
 NOISE_BAND = 0.25
 
 
+def metric_cells(lines, key, default=None) -> dict:
+    """Mean of each platform's rank metric, grouped by `key`.
+
+    A missing key is skipped when `default` is None, so optional fields stay
+    optional: older performance rows have no hook_type and must not fall into
+    a fake bucket.
+    """
+    out: dict = {}
+    for p, metric in RANK_BY.items():
+        agg: dict = {}
+        for r in lines:
+            v = r.get(key, default)
+            if v is None or r.get("platform") != p or r.get(metric) is None:
+                continue
+            agg.setdefault(str(v), []).append(r[metric])
+        out[p] = {k: {"clips": len(v), metric: round(sum(v) / len(v), 1)}
+                  for k, v in sorted(agg.items())}
+    return out
+
+
 def _outliers(ranked, platform):
     """(best, worst) - each None unless it clears NOISE_BAND around the median."""
     if len(ranked) < 3:
@@ -641,25 +661,15 @@ def main() -> int:
     # compared them, so the data was being collected and never read.
     # Episode-blind on purpose: a cell only becomes readable once it has
     # accumulated across several batches, so this aggregates everything.
-    def _cells(key, default=None):
-        out: dict = {}
-        for p, metric in RANK_BY.items():
-            agg: dict = {}
-            for r in lines:
-                v = r.get(key, default)
-                if v is None or r.get("platform") != p or r.get(metric) is None:
-                    continue
-                agg.setdefault(str(v), []).append(r[metric])
-            out[p] = {k: {"clips": len(v), metric: round(sum(v) / len(v), 1)}
-                      for k, v in sorted(agg.items())}
-        return out
-
-    by_hook_style = _cells("hook_style", "flash")   # untagged rows are the default arm
-    by_variant = _cells("variant")
+    by_hook_style = metric_cells(lines, "hook_style", "flash")  # untagged = flash
+    by_variant = metric_cells(lines, "variant")
+    # hook_type is optional. Rows from before the field existed are skipped,
+    # not lumped into "other".
+    by_hook_type = metric_cells(lines, "hook_type")
     # Every ab_* dimension any row carries, reported without needing code here:
     # a new test is a filename tag, not a patch to the scraper.
     ab_dims = sorted({k for r in lines for k in r if k.startswith("ab_")})
-    by_ab = {d: _cells(d, "control") for d in ab_dims}
+    by_ab = {d: metric_cells(lines, d, "control") for d in ab_dims}
 
     print(json.dumps({
         "status": "ok", "updated": len(updated), "failed": len(failures),
@@ -671,6 +681,7 @@ def main() -> int:
         "ranked": ranked,
         "by_speaker": by_speaker,
         "by_hook_style": by_hook_style,
+        "by_hook_type": by_hook_type,
         "by_variant": by_variant,
         "by_ab": by_ab,
         "all": updated,

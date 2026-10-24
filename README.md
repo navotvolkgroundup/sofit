@@ -128,7 +128,9 @@ default moved because macOS TCC blocks launchd/cron from Documents) with
 metrics left empty for your
 analytics-scraper of choice to fill; once 8+ rows carry views/retention,
 pool generation starts weighting the hooks that actually held viewers over
-its own priors.
+its own priors. Each row may also carry optional `hook_type` (the opening
+label from the clip spec). Older rows without it still parse, and the
+metrics summary groups the rows that have it under `by_hook_type`.
 
 ## How it works
 
@@ -296,10 +298,13 @@ from the clip spec, so editing `hook` in the clips.json and re-rendering changes
 turn it off with `--no-hook-card`, or the `hook_card` param on the MCP render tools.
 
 **A/B-testing hooks.** Each clip also carries `hook_variants` — 2 alternate opener lines
-taking a different angle from the primary (if the hook is a question, an alternate might be
-a bold claim or a surprising number). Render one with `--hook-variant N` (1-based; `0` is the
+taking a different angle from the primary. Prefer a relatable callout, a curiosity gap,
+or high stakes for those alternates. Render one with `--hook-variant N` (1-based; `0` is the
 primary). Variant renders are written to `<id>.hookN.mp4` so they sit alongside the original
 instead of overwriting it — post them and let the retention curve pick the winner.
+The clip spec also carries `hook_type` for the primary opening (and
+`hook_variant_types`, aligned with the alternates). `sofit publish-log` copies
+the label for the line that was posted onto the performance row.
 ```bash
 sofit --render-from clips.json --render-clips out --only clip-3                   # primary hook
 sofit --render-from clips.json --render-clips out --only clip-3 --hook-variant 1  # -> clip-3.hook1.mp4
@@ -340,7 +345,8 @@ word or an English brand name (e.g. `OpenAI` → `אופן-איי-איי`). Corr
 
 ### Feeding a social-clip renderer
 `--clips-json PATH` writes a clip spec for a downstream vertical-clip renderer (e.g. a
-Remotion app): each pull-quote becomes `{id, start, end, hook, focus, words}` where cut
+Remotion app): each pull-quote becomes `{id, start, end, hook, focus, words}`
+(and, when the shortlist labeled it, optional `hook_type`) where cut
 times (`start`/`end`) are absolute episode seconds and caption `words[].t` are relative
 to the clip start. The renderer crops to 9:16, burns Hebrew captions from `words`, and
 adds a hook/branding card. `sofit` finds and times the moments; it does not
@@ -354,12 +360,16 @@ sofit episode.mp4 --clips-json clips.json
 **Learning from what actually worked.** Clip selection starts from short-form research
 priors, but the honest signal is your own numbers. Record each posted clip:
 ```bash
-python skills/sofit/clips.py log WS203 clip-5 "<hook posted>" --platform tiktok --retention 47
+python skills/sofit/clips.py log WS203 clip-5 "<hook posted>" \
+    --platform tiktok --retention 47 --spec episode.clips.json
 ```
 Once the log has 8+ rows, pool generation includes the best- and worst-performing real
 hooks in its prompt and weights them over the priors. Below 8 it stays quiet — "what
-worked" over three posts is noise. The log lives at `~/Documents/sofit-performance.jsonl`
-(outside the repo; override with `SOFIT_PERF_LOG`).
+worked" over three posts is noise. The log lives at `~/.sofit/performance.jsonl`
+(legacy `~/Documents/sofit-performance.jsonl` if that is the only log; override with
+`SOFIT_PERF_LOG`). `hook_type` on a row is optional. Pass `--hook-type` or `--spec`
+(the clips.json from `build`) and the manual `log` command copies it; leave it off
+and the row is unchanged.
 
 ## Roadmap
 

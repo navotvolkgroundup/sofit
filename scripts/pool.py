@@ -30,8 +30,9 @@ POOL_SYSTEM = (
     "You are picking a POOL of candidate short-form clips from a Hebrew podcast "
     "(Reels/TikTok/Shorts) for a human to choose from. Find the {n} strongest, most "
     "DISTINCT moments across the whole episode. " + gen.CLIP_RULES + " Return ONLY a JSON array "
-    '[{"title":str,"hook_type":str,"score":int,"reason":str,'
-    '"beats":[{"quote_start":str,"quote_end":str}],"hook_variants":[str,str]}]. '
+    '[{"title":str,"hook_type":str,"hook_reason":str,"score":int,"reason":str,'
+    '"beats":[{"quote_start":str,"quote_end":str}],"hook_variants":[str,str],'
+    '"hook_variant_types":[str,str],"alt_opening":str,"alt_hook_type":str}]. '
     + gen.CLIP_FIELDS +
     " reason = one short English line on why it would perform. "
     "Cover different topics. Only include clips you would score 7 or higher."
@@ -63,20 +64,35 @@ def cmd_pool(video, out, n, titler):
             q = gen.resolve_clip_item(it, segs, audio_end)
             if q is None:
                 continue
-            out_rows.append({
+            row = {
                 "start": round(q.start, 3), "end": round(q.end, 3),
                 "beats": [[round(s, 3), round(e, 3)] for s, e in q.beats],
                 "score": int(it.get("score", 0)), "hook": q.text,
-                "type": it.get("hook_type", ""),
+                # `type` is the pre-existing key; `hook_type` is the same label
+                # under the name the rest of the pipeline stores.
+                "type": q.hook_type,
+                "hook_type": q.hook_type,
                 "reason": (it.get("reason") or "").strip(),
                 "hook_variants": list(q.variants),
-            })
+                "flagged": q.hook_type in gen.FLAGGED_HOOK_TYPES,
+            }
+            if q.hook_reason:
+                row["hook_reason"] = q.hook_reason
+            if q.alt_opening:
+                row["alt_opening"] = q.alt_opening
+            if q.alt_hook_type:
+                row["alt_hook_type"] = q.alt_hook_type
+            if any(q.variant_types):
+                row["hook_variant_types"] = list(q.variant_types)
+            out_rows.append(row)
         if not out_rows:
             raise gen.GenerationError("no candidates met the bar")
         return out_rows
 
     cands = gen.call_claude_json(system, user, validate, titler=titler)
-    cands.sort(key=lambda c: -c["score"])
+    # Higher model score still wins. Equal scores lean toward the preferred
+    # opening types. Nothing is dropped for its hook_type.
+    cands.sort(key=lambda c: gen.hook_rank_key(c["score"], c.get("hook_type") or ""))
     kept = []
     for c in cands:
         if any(not (c["end"] <= k["start"] or c["start"] >= k["end"]) for k in kept):
@@ -88,13 +104,7 @@ def cmd_pool(video, out, n, titler):
               open(out, "w"), ensure_ascii=False, indent=2)
     print(f"wrote {out} ({len(kept)} candidates)\n")
     for i, c in enumerate(kept, 1):
-        m, s = divmod(int(c["start"]), 60)
-        beats = c.get("beats") or [[c["start"], c["end"]]]
-        kept_sec = int(sum(e - b for b, e in beats))
-        cuts = "" if len(beats) == 1 else f", {len(beats)} beats ({len(beats)-1} cut)"
-        print(f"{i:2d}. [{m}:{s:02d}] ({kept_sec}s{cuts}, {c['type']}, "
-              f"score {c['score']}) {c['hook']}")
-        print(f"      why: {c['reason']}")
+        print(gen.format_pool_candidate(i, c))
 
 
 def cmd_build(video, pool_path, pick, out):
@@ -107,9 +117,19 @@ def cmd_build(video, pool_path, pick, out):
         c = cands[n - 1]  # 1-based, matches the pool table
         beats = tuple((float(s), float(e)) for s, e in
                       (c.get("beats") or [[c["start"], c["end"]]]))
+        raw_type = c.get("hook_type") or c.get("type") or ""
+        raw_alt_type = c.get("alt_hook_type") or ""
         q = gen.Quote(start=float(c["start"]), end=float(c["end"]),
                       text=c["hook"], variants=tuple(c.get("hook_variants") or []),
-                      beats=beats)
+                      variant_types=tuple(
+                          gen.normalize_hook_type(t) if isinstance(t, str) and t.strip() else ""
+                          for t in (c.get("hook_variant_types") or [])),
+                      beats=beats,
+                      hook_type=gen.normalize_hook_type(raw_type) if raw_type else "",
+                      hook_reason=(c.get("hook_reason") or "").strip(),
+                      alt_opening=(c.get("alt_opening") or "").strip(),
+                      alt_hook_type=(gen.normalize_hook_type(raw_alt_type)
+                                     if raw_alt_type else ""))
         clips.append(gen.clip_spec(q, segs, f"clip-{n}"))
     out = out or os.path.splitext(video)[0] + ".clips.json"
     json.dump({"schema_version": 1, "source": {"video": os.path.abspath(video)},
@@ -117,10 +137,30 @@ def cmd_build(video, pool_path, pick, out):
     print(f"wrote {out} ({len(clips)} clips: {nums})")
 
 
-def cmd_log(episode, clip, hook, platform, views, retention, variant, path):
+def _hook_type_for_log(hook_type, spec, clip, variant):
+    """Optional label. --hook-type wins; otherwise copy it off the clip spec.
+
+    Missing on both is fine: rows written before hook_type existed stay valid.
+    """
+    if hook_type:
+        try:
+            return gen.parse_hook_type(hook_type)
+        except ValueError as e:
+            sys.exit(f"error: {e}")
+    if not spec:
+        return None
+    from sofit.publog import hook_type_from_spec
+    return hook_type_from_spec(spec, clip, variant)
+
+
+def cmd_log(episode, clip, hook, platform, views, retention, variant, path,
+            hook_type="", spec=None):
     """Append one posted clip's numbers to the performance log."""
     row = {"date": __import__("datetime").date.today().isoformat(), "episode": episode,
            "clip": clip, "variant": variant, "platform": platform, "hook": hook}
+    labeled = _hook_type_for_log(hook_type, spec, clip, variant)
+    if labeled:
+        row["hook_type"] = labeled
     if views is not None:
         row["views"] = views
     if retention is not None:
@@ -157,13 +197,17 @@ def main():
     lp.add_argument("--views", type=int)
     lp.add_argument("--retention", type=float, help="percent watched (the better signal)")
     lp.add_argument("--variant", type=int, default=0)
+    lp.add_argument("--hook-type", default="",
+                    help="opening type of the posted hook (optional; "
+                         "else copied from --spec)")
+    lp.add_argument("--spec", help="clips.json to copy hook_type from")
     lp.add_argument("--path")
     a = p.parse_args()
     if a.cmd == "pool":
         cmd_pool(a.video, a.out, a.n, a.titler)
     elif a.cmd == "log":
         cmd_log(a.episode, a.clip, a.hook, a.platform, a.views, a.retention,
-                a.variant, a.path)
+                a.variant, a.path, a.hook_type, a.spec)
     else:
         cmd_build(a.video, a.pool, a.pick, a.out)
 
