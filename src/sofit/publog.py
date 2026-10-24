@@ -68,21 +68,65 @@ def _duration(path: Path) -> float | None:
         return None
 
 
-def _hook_from_spec(spec_path: Path, clip_id: str, variant: int) -> str | None:
+def _clip_from_spec(spec_path: Path, clip_id: str) -> dict | None:
     try:
         doc = json.loads(spec_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     for c in doc.get("clips", []):
         if str(c.get("id")) == clip_id:
-            if variant == 0:
-                return c.get("hook")
-            alts = c.get("hook_variants") or []
-            return alts[variant - 1] if variant <= len(alts) else c.get("hook")
+            return c
     return None
 
 
-def _hook_near_file(clip_file: Path, clip_id: str, variant: int) -> str | None:
+def _hook_text(clip: dict, variant: int) -> str | None:
+    if variant == 0:
+        return clip.get("hook")
+    alts = clip.get("hook_variants") or []
+    return alts[variant - 1] if variant <= len(alts) else clip.get("hook")
+
+
+def _hook_type_text(clip: dict, variant: int) -> str | None:
+    """Opening label for the line that was actually posted.
+
+    Variant 0 is the primary hook. A later variant uses hook_variant_types
+    when that list was stored, and otherwise stays unlabeled — copying the
+    primary's type onto a different line would pollute the grouping.
+    """
+    if variant == 0:
+        raw = clip.get("hook_type")
+    else:
+        types = clip.get("hook_variant_types") or []
+        raw = types[variant - 1] if variant <= len(types) else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def hook_type_from_spec(spec_path, clip_id: str, variant: int = 0) -> str | None:
+    """Canonical hook_type from a clips.json entry, or None if it has none.
+
+    Old specs without the field return None so a log row can omit it.
+    """
+    from . import generate
+
+    clip = _clip_from_spec(Path(spec_path), clip_id)
+    if not clip:
+        return None
+    raw = _hook_type_text(clip, variant)
+    if not raw:
+        return None
+    return generate.normalize_hook_type(raw)
+
+
+def _hook_from_spec(spec_path: Path, clip_id: str, variant: int) -> str | None:
+    clip = _clip_from_spec(spec_path, clip_id)
+    if not clip:
+        return None
+    return _hook_text(clip, variant)
+
+
+def _clip_near_file(clip_file: Path, clip_id: str, variant: int) -> dict | None:
     """Search every *.clips.json near the rendered file; the spec that actually
     CONTAINS this clip id wins (a directory can hold several batches' specs)."""
     for d in (clip_file.parent, clip_file.parent.parent):
@@ -93,10 +137,17 @@ def _hook_near_file(clip_file: Path, clip_id: str, variant: int) -> str | None:
         # spec with a DIFFERENT hook (bit us on WS_13.08 clips 1/5/6).
         for spec in sorted(d.glob("*.clips*.json"),
                            key=lambda p: p.stat().st_mtime, reverse=True):
-            hook = _hook_from_spec(spec, clip_id, variant)
-            if hook:
-                return hook
+            clip = _clip_from_spec(spec, clip_id)
+            if clip and _hook_text(clip, variant):
+                return clip
     return None
+
+
+def _hook_near_file(clip_file: Path, clip_id: str, variant: int) -> str | None:
+    clip = _clip_near_file(clip_file, clip_id, variant)
+    if not clip:
+        return None
+    return _hook_text(clip, variant)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--url", required=True, help="the live post URL")
     p.add_argument("--spec", help="clips.json spec (default: auto-discover next to the file)")
     p.add_argument("--hook", help="hook text override (else read from the spec)")
+    p.add_argument("--hook-type", dest="hook_type",
+                   help="opening type override (else read from the spec; "
+                        "omitted when the spec has none, so old rows stay valid)")
     p.add_argument("--speaker", help="who fronts the clip (first face/voice on "
                    "screen) - lets the log answer 'who should open clips' with "
                    "data instead of memory")
@@ -124,20 +178,32 @@ def main(argv: list[str] | None = None) -> int:
     clip_id, variant = _clip_and_variant(args.clip)
     clip_path = Path(args.clip)
 
-    hook = args.hook
-    if not hook and args.spec:
-        hook = _hook_from_spec(Path(args.spec), clip_id, variant)
-    if not hook and clip_path.exists():
-        hook = _hook_near_file(clip_path, clip_id, variant)
+    entry = _clip_from_spec(Path(args.spec), clip_id) if args.spec else None
+    if entry is None and clip_path.exists():
+        entry = _clip_near_file(clip_path, clip_id, variant)
+
+    hook = args.hook or (_hook_text(entry, variant) if entry else None)
     if not hook:
         print("error: hook text not found - pass --spec or --hook", file=sys.stderr)
         return 1
+
+    if args.hook_type:
+        try:
+            hook_type = generate.parse_hook_type(args.hook_type)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    else:
+        raw_type = _hook_type_text(entry, variant) if entry else None
+        hook_type = generate.normalize_hook_type(raw_type) if raw_type else None
 
     row: dict = {
         "date": datetime.date.today().isoformat(),
         "episode": args.episode, "clip": clip_id, "variant": variant,
         "platform": args.platform, "hook": hook, "post_url": args.url,
     }
+    if hook_type:
+        row["hook_type"] = hook_type
     if ".pers" in Path(args.clip).name:
         row["hook_style"] = "persistent"
     for tag in _ab_tags(args.clip):
@@ -169,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = generate._perf_rows(log_path)
     need = max(0, generate.MIN_PERF_ROWS - len(rows))
-    print(f"logged {clip_id} (variant {variant}, {args.platform}) -> {log_path}")
+    typed = f", {hook_type}" if hook_type else ""
+    print(f"logged {clip_id} (variant {variant}, {args.platform}{typed}) -> {log_path}")
     print(f"metrics pending (the scraper fills them at T+3d); "
           f"{need} more attributed row(s) until pool generation learns from data.")
     return 0

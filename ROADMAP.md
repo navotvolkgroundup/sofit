@@ -78,6 +78,17 @@ prompt contract. Both are now single-sourced in `generate.py`:
   into both prompts. This is the exact drift that let the pool ask for 20-60s clips while
   the code clamped at 45.
 
+### Hook types on the shortlist
+Every candidate is labeled with an opening type (`curiosity_gap`,
+`relatable_callout`, `high_stakes`, `pattern_interrupt`, `bold_claim`,
+`question`, `controversy`, `middle_of_action`, `visual_spectacle`, `other`)
+plus a one-line reason, in the same prompt the shortlist already uses.
+Relatable callout, curiosity gap, and high stakes win an equal-score tie.
+Question, controversy, and bold claim are flagged and may carry an alternate
+opening copied from the transcript. The user still picks. `hook_type` is
+optional on the clip spec and on `performance.jsonl`; the metrics summary
+groups rows that have it. Length stays 20-45s.
+
 ## Proposed (next)
 
 Nothing queued. The natural next input is real performance data: once clips with different
