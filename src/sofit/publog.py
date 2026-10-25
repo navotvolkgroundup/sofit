@@ -103,20 +103,36 @@ def _hook_type_text(clip: dict, variant: int) -> str | None:
     return None
 
 
-def hook_type_from_spec(spec_path, clip_id: str, variant: int = 0) -> str | None:
-    """Canonical hook_type from a clips.json entry, or None if it has none.
+def _spec_hook_type(clip: dict | None, variant: int, posted_hook: str | None) -> str | None:
+    """The spec's label, but only when the line being logged IS the labelled line.
 
-    Old specs without the field return None so a log row can omit it.
+    --hook replaces the text without replacing the label, so a hand-written
+    opening would otherwise be filed under the type of the line it replaced
+    and land in the wrong by_hook_type bucket. Same reasoning as
+    :func:`_hook_type_text` applies to variants.
     """
     from . import generate
 
-    clip = _clip_from_spec(Path(spec_path), clip_id)
     if not clip:
         return None
     raw = _hook_type_text(clip, variant)
     if not raw:
         return None
+    if posted_hook is not None:
+        labelled = (_hook_text(clip, variant) or "").strip()
+        if labelled and posted_hook.strip() != labelled:
+            return None
     return generate.normalize_hook_type(raw)
+
+
+def hook_type_from_spec(spec_path, clip_id: str, variant: int = 0,
+                        hook: str | None = None) -> str | None:
+    """Canonical hook_type from a clips.json entry, or None if it has none.
+
+    Old specs without the field return None so a log row can omit it. Pass
+    `hook` to refuse the label when that is not the line the spec labelled.
+    """
+    return _spec_hook_type(_clip_from_spec(Path(spec_path), clip_id), variant, hook)
 
 
 def _hook_from_spec(spec_path: Path, clip_id: str, variant: int) -> str | None:
@@ -179,8 +195,10 @@ def main(argv: list[str] | None = None) -> int:
     clip_path = Path(args.clip)
 
     entry = _clip_from_spec(Path(args.spec), clip_id) if args.spec else None
-    if entry is None and clip_path.exists():
-        entry = _clip_near_file(clip_path, clip_id, variant)
+    # A spec that names the clip but carries no hook text must not stop the
+    # search; the sibling specs beside the rendered file may still have it.
+    if (entry is None or not _hook_text(entry, variant)) and clip_path.exists():
+        entry = _clip_near_file(clip_path, clip_id, variant) or entry
 
     hook = args.hook or (_hook_text(entry, variant) if entry else None)
     if not hook:
@@ -194,8 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
     else:
-        raw_type = _hook_type_text(entry, variant) if entry else None
-        hook_type = generate.normalize_hook_type(raw_type) if raw_type else None
+        hook_type = _spec_hook_type(entry, variant, args.hook)
 
     row: dict = {
         "date": datetime.date.today().isoformat(),

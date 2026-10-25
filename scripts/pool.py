@@ -137,10 +137,13 @@ def cmd_build(video, pool_path, pick, out):
     print(f"wrote {out} ({len(clips)} clips: {nums})")
 
 
-def _hook_type_for_log(hook_type, spec, clip, variant):
+def _hook_type_for_log(hook_type, spec, clip, variant, hook=None):
     """Optional label. --hook-type wins; otherwise copy it off the clip spec.
 
-    Missing on both is fine: rows written before hook_type existed stay valid.
+    The spec's label is only copied when `hook` is the line the spec labelled:
+    a hand-written opening filed under the replaced line's type would land in
+    the wrong by_hook_type bucket. Missing on both is fine: rows written
+    before hook_type existed stay valid.
     """
     if hook_type:
         try:
@@ -150,7 +153,7 @@ def _hook_type_for_log(hook_type, spec, clip, variant):
     if not spec:
         return None
     from sofit.publog import hook_type_from_spec
-    return hook_type_from_spec(spec, clip, variant)
+    return hook_type_from_spec(spec, clip, variant, hook)
 
 
 def cmd_log(episode, clip, hook, platform, views, retention, variant, path,
@@ -158,7 +161,7 @@ def cmd_log(episode, clip, hook, platform, views, retention, variant, path,
     """Append one posted clip's numbers to the performance log."""
     row = {"date": __import__("datetime").date.today().isoformat(), "episode": episode,
            "clip": clip, "variant": variant, "platform": platform, "hook": hook}
-    labeled = _hook_type_for_log(hook_type, spec, clip, variant)
+    labeled = _hook_type_for_log(hook_type, spec, clip, variant, hook)
     if labeled:
         row["hook_type"] = labeled
     if views is not None:

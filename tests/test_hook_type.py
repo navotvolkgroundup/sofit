@@ -336,3 +336,53 @@ def test_metrics_summary_groups_by_hook_type_and_skips_old_rows():
          {"platform": "tiktok", "avg_watch_s": 5}],
         "hook_style", "flash")
     assert set(styled["tiktok"]) == {"persistent", "flash"}
+
+
+def test_hook_override_does_not_inherit_the_specs_label(tmp_path):
+    # --hook replaces the posted line. Copying the spec's hook_type onto it
+    # files a hand-written opening under the type of the line it replaced,
+    # which is exactly the grouping by_hook_type is built on.
+    from sofit import publog
+
+    spec = tmp_path / "ep.clips.json"
+    spec.write_text(json.dumps({"schema_version": 1, "clips": [
+        {"id": "clip-3", "hook": "האם AI יחליף אותנו?", "hook_type": "question"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    log = tmp_path / "perf.jsonl"
+    (tmp_path / "clip-3.mp4").touch()
+
+    # A different opening: the spec's "question" label must not follow it.
+    assert publog.main([str(tmp_path / "clip-3.mp4"), "--episode", "212",
+                        "--platform", "tiktok", "--url", "https://t.example/9",
+                        "--spec", str(spec), "--hook", "ניסיתי את זה בעצמי",
+                        "--log", str(log)]) == 0
+    row = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["hook"] == "ניסיתי את זה בעצמי"
+    assert "hook_type" not in row
+
+    # The spec's own line keeps its label.
+    assert publog.main([str(tmp_path / "clip-3.mp4"), "--episode", "212",
+                        "--platform", "tiktok", "--url", "https://t.example/10",
+                        "--spec", str(spec), "--hook", "האם AI יחליף אותנו?",
+                        "--log", str(log)]) == 0
+    assert json.loads(log.read_text(encoding="utf-8").splitlines()[-1])["hook_type"] == "question"
+
+
+def test_a_hookless_spec_entry_still_falls_through_to_siblings(tmp_path):
+    # A spec naming the clip without hook text must not end the search.
+    from sofit import publog
+
+    (tmp_path / "a.clips.json").write_text(json.dumps(
+        {"schema_version": 1, "clips": [{"id": "clip-9", "hook_type": "high_stakes"}]}),
+        encoding="utf-8")
+    (tmp_path / "b.clips.json").write_text(json.dumps(
+        {"schema_version": 1, "clips": [{"id": "clip-9", "hook": "ההוק האמיתי"}]},
+        ensure_ascii=False), encoding="utf-8")
+    (tmp_path / "clip-9.mp4").touch()
+    log = tmp_path / "perf.jsonl"
+
+    assert publog.main([str(tmp_path / "clip-9.mp4"), "--episode", "212",
+                        "--platform", "tiktok", "--url", "https://t.example/11",
+                        "--spec", str(tmp_path / "a.clips.json"),
+                        "--log", str(log)]) == 0
+    assert json.loads(log.read_text(encoding="utf-8").splitlines()[-1])["hook"] == "ההוק האמיתי"
