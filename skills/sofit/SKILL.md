@@ -84,7 +84,10 @@ NEVER auto-render the whole pool. Generate candidates, show the table, let the u
 ```bash
 "$PY" "$SKILL/clips.py" pool "<episode.mp4>"          # writes <episode>.pool.json + prints a numbered table
 ```
-Present the table; ask which numbers to render. Then build the spec from the picks:
+Present the whole table, including each candidate's `hook_type`, the one-line
+reason, a `flag` on question / controversy / bold_claim, and any `alt opening`.
+The user still picks — do not drop a flagged row or swap the alt in unasked.
+Then build the spec from the picks (`hook_type` is copied into clips.json):
 ```bash
 "$PY" "$SKILL/clips.py" build "<episode.mp4>" "<episode>.pool.json" --pick 2,4,7
 ```

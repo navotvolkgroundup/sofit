@@ -1,6 +1,8 @@
 # sofit scripts
 
-- `pool.py` — candidate-pool generator + spec builder (suggest → pick → build)
+- `pool.py` — candidate-pool generator + spec builder (suggest → pick → build).
+  Each candidate is labeled with a `hook_type` and a one-line reason; the label
+  is copied into clips.json and, from there, into the performance log.
 - `quotecards.py` — branded IG carousel quote-cards from episode pull-quotes
 - `publish/` — semi-automated publish + measure pipeline:
   uploaders for TikTok / Instagram / LinkedIn / YouTube Shorts (Playwright

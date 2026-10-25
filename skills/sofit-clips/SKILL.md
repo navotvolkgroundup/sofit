@@ -65,19 +65,45 @@ Enforced in code — nothing to do at cut time, they happen automatically:
 | Word-by-word karaoke captions, white + outline, lower-middle third | `render.py` |
 | 2 alternate hooks per clip for A/B | `--hook-variant N` |
 
-Needs judgment when picking from the pool — the tool can't decide these:
-- **Prefer a curiosity gap**: an opener posing a question the clip hasn't answered yet.
-  Hard numbers ("44% צועקים נציג") and contrarian claims ("זה בולשיט") both work.
+Needs judgment when picking from the pool — the tool labels these, it does not decide:
+- **Hook type is on every candidate** (Ames Create, Oct 2026, 1,239 top videos).
+  The shortlist prints `hook_type` plus a one-line reason. Lean toward
+  `relatable_callout`, `curiosity_gap`, and `high_stakes`. `question`,
+  `controversy`, and `bold_claim` are marked `flag` and, when the transcript
+  has one, carry an `alt opening` that starts on the story instead of the
+  provocation. That is a suggestion. The user still picks, and a higher score
+  still beats a preferred type — nothing is dropped for its label.
+  Median top YouTube Short in that study was 27s; the length bar stays 20-45s
+  (under 60s).
 - **Keep the visual layer plain.** Senior editors consistently say flashy transitions and
   VFX date fast; story and hard cuts win. Don't add motion for its own sake.
+  `visual_spectacle` is a real label and a rare one; don't invent it for a talking head.
 - **A/B the opener when a clip matters** rather than agonizing over one line — render 2
-  variants and let the retention curve decide.
+  variants and let the retention curve decide. Prefer the alternate to be a
+  relatable callout, a curiosity gap, or high stakes.
 
 ## 1. Candidate pool → user picks
 ```bash
 "$PY" "$SKILL/clips.py" pool "<episode.mp4>"          # writes <episode>.pool.json + a numbered table
 ```
-Present the table; ask which numbers to render. Build the spec from the picks:
+Present the whole table, including hook type, the one-line reason, any `flag`,
+and any `alt opening`. Ask which numbers to render. Do not drop a flagged
+candidate, and do not swap in the alt opening unless the user asks. Sample:
+
+```
+ 1. [14:22] (31s, curiosity_gap, score 9) כתבת "אקס גוגל" בלינקדאין? זה משדר בדיוק הפוך
+      type: withholds what the LinkedIn line actually signals
+      why: viewer's own profile line, payoff lands later in the clip
+ 2. [22:08] (27s, bold_claim flag, score 8) זה בולשיט מוחלט
+      type: opens on the provocation, no stake yet
+      why: sharp opinion, but the claim is the whole first line
+      alt opening (curiosity_gap): הלקוח שילם ארבעים אלף וקיבל דף אחד
+```
+
+`hook_type` is one of curiosity_gap, relatable_callout, high_stakes,
+pattern_interrupt, bold_claim, question, controversy, middle_of_action,
+visual_spectacle, other. Build the spec from the picks — the label rides
+along into clips.json:
 ```bash
 "$PY" "$SKILL/clips.py" build "<episode.mp4>" "<episode>.pool.json" --pick 2,4,7
 ```
@@ -141,12 +167,19 @@ After posting, record the numbers — this is the ONLY step that turns priors in
 signal, and the data is perishable (unrecorded, which hook won is gone).
 ```bash
 "$PY" "$SKILL/clips.py" log WS203 clip-5 "<the hook that was posted>" \
-  --platform tiktok --views 12400 --retention 47
+  --platform tiktok --views 12400 --retention 47 \
+  --spec "<episode>.clips.json"
 ```
 - `--retention` (percent watched) is the signal that matters; views are confounded by
   posting time and follower count. Log it when the platform gives it to you.
 - Use `--variant N` when you posted an alternate hook, so A/B results stay attributable.
-- Appends to `~/Documents/sofit-performance.jsonl` (outside the repo — it is public).
+  `hook_type` is copied from the clip spec (`hook_variant_types` for a variant).
+  Pass `--hook-type curiosity_gap` to override. Omit both and the row simply has
+  no `hook_type` — older rows stay valid.
+- `sofit publish-log` writes the same optional field from the spec. The metrics
+  summary groups rows that have it under `by_hook_type`.
+- Appends to `~/.sofit/performance.jsonl` (outside the repo — it is public).
+  `~/Documents/sofit-performance.jsonl` is still used when it is the only log.
   Override with `SOFIT_PERF_LOG`.
 - At **8+ rows** pool generation starts including the best/worst real hooks in its prompt
   and weighting them over research priors. Below that it stays silent on purpose — "what

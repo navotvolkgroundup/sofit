@@ -33,6 +33,133 @@ CLAUDE_MODEL = "claude-sonnet-5"
 CLI_TIMEOUT = int(os.environ.get("SOFIT_CLI_TIMEOUT") or 900)
 
 
+# Opening types for a short-form clip, from the Ames Create study of 1,239 top
+# creator videos (Oct 2026). The label describes the FIRST line the viewer hears
+# or reads, not the topic of the clip. Preference is a lean: the human still
+# picks, and a higher model score still beats a preferred type.
+# Lift vs each creator's own typical top video, for the note in the prompt:
+#   relatable_callout +19%, high_stakes +5%, curiosity_gap +3% (also 28% of
+#   top openings), visual_spectacle +33% but only 2% of videos, middle_of_action
+#   -1%, pattern_interrupt -2%, bold_claim -10%, question -14%, controversy -30%.
+HOOK_TYPES: tuple[str, ...] = (
+    "curiosity_gap",
+    "relatable_callout",
+    "high_stakes",
+    "pattern_interrupt",
+    "bold_claim",
+    "question",
+    "controversy",
+    "middle_of_action",
+    "visual_spectacle",
+    "other",
+)
+PREFERRED_HOOK_TYPES = frozenset({
+    "relatable_callout",
+    "curiosity_gap",
+    "high_stakes",
+})
+# Flag these in the shortlist and, when the transcript has one, suggest a
+# different opening line. Never drop the candidate because of them.
+FLAGGED_HOOK_TYPES = frozenset({
+    "question",
+    "controversy",
+    "bold_claim",
+})
+# Labels the previous prompt asked for. Mapped so an old model reply still parses.
+_LEGACY_HOOK_TYPES = {
+    "surprise": "curiosity_gap",
+    "emotion": "other",
+    "story": "middle_of_action",
+}
+
+
+def normalize_hook_type(value) -> str:
+    """Canonical hook_type, or ``other`` when the label is missing or unknown.
+
+    Case, spaces, and hyphens are ignored (``Bold Claim`` -> ``bold_claim``).
+    A bad label must not drop the candidate, so this never raises.
+    """
+    if not isinstance(value, str):
+        return "other"
+    key = re.sub(r"[\s\-]+", "_", value.strip().lower())
+    if key in HOOK_TYPES:
+        return key
+    return _LEGACY_HOOK_TYPES.get(key, "other")
+
+
+def parse_hook_type(value: str) -> str:
+    """Hook type from a person or a flag. Unknown labels raise ValueError.
+
+    Legacy aliases are accepted. Use :func:`normalize_hook_type` for model
+    output, where a bad label should become ``other`` instead of failing.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("hook_type is empty")
+    key = re.sub(r"[\s\-]+", "_", value.strip().lower())
+    mapped = key if key in HOOK_TYPES else _LEGACY_HOOK_TYPES.get(key)
+    if mapped not in HOOK_TYPES:
+        allowed = ", ".join(HOOK_TYPES)
+        raise ValueError(f"unknown hook_type {value!r}; expected one of {allowed}")
+    return mapped
+
+
+def hook_rank_key(score: int, hook_type: str) -> tuple[int, int]:
+    """Sort key for the shortlist (lower sorts first).
+
+    Soft preference only. The stored score is the model's score, unchanged.
+    Equal scores lean toward relatable callout, curiosity gap, and high stakes,
+    and away from question, controversy, and bold claim. A higher score still
+    wins, and no type is removed.
+    """
+    if hook_type in PREFERRED_HOOK_TYPES:
+        bias = 1
+    elif hook_type in FLAGGED_HOOK_TYPES:
+        bias = -1
+    else:
+        bias = 0
+    return (-int(score), -bias)
+
+
+def opening_in_transcript(line: str, segments: list[Segment]) -> bool:
+    """True when `line` is a real stretch of this transcript, not a paraphrase.
+
+    Same match as chapter location: the first few normalized words must occur
+    in some segment. Under three words is too easy to false-match, so those
+    suggestions are dropped and the candidate itself stays.
+    """
+    if len(_norm(line).split()) < 3:
+        return False
+    return _locate(line, segments, 0) is not None
+
+
+def format_pool_candidate(index: int, cand: dict) -> str:
+    """Numbered shortlist lines. Every candidate shows its hook type.
+
+    Flagged openings (question, controversy, bold claim) are marked, and an
+    alternate line is printed when the transcript had one.
+    """
+    m, s = divmod(int(cand["start"]), 60)
+    beats = cand.get("beats") or [[cand["start"], cand["end"]]]
+    kept_sec = int(sum(e - b for b, e in beats))
+    cuts = "" if len(beats) == 1 else f", {len(beats)} beats ({len(beats) - 1} cut)"
+    hook_type = cand.get("hook_type") or cand.get("type") or "other"
+    flag = " flag" if hook_type in FLAGGED_HOOK_TYPES else ""
+    lines = [
+        f"{index:2d}. [{m}:{s:02d}] ({kept_sec}s{cuts}, {hook_type}{flag}, "
+        f"score {cand['score']}) {cand['hook']}"
+    ]
+    why_type = (cand.get("hook_reason") or "").strip()
+    if why_type:
+        lines.append(f"      type: {why_type}")
+    lines.append(f"      why: {cand.get('reason', '')}")
+    alt = (cand.get("alt_opening") or "").strip()
+    if alt and hook_type in FLAGGED_HOOK_TYPES:
+        label = cand.get("alt_hook_type") or ""
+        suffix = f" ({label})" if label else ""
+        lines.append(f"      alt opening{suffix}: {alt}")
+    return "\n".join(lines)
+
+
 # What makes a good short-form clip, and what each JSON field means. Shared by the
 # one-shot selector (`make_quotes`) and the skill's candidate-pool generator so the
 # two prompts can't drift on the contract — they already did once, with the pool
@@ -47,14 +174,18 @@ BRAND_RULE = (
 )
 
 CLIP_RULES = (
-    "Each clip MUST: (1) OPEN with a hook in its VERY FIRST sentence — a question, a "
-    "bold or contrarian claim, a surprising fact, or a strong emotional moment — that "
-    "stops the scroll within ~3 seconds. Completion rate is what triggers viral "
-    "distribution and it is decided in those first seconds, so open with the PAYOFF "
-    "or the punchy claim itself, never the wind-up ('today we will talk about...'). "
-    "The strongest hooks open a CURIOSITY GAP: they raise a question in the viewer's "
-    "mind that the clip has not yet answered, so they must keep watching to close it "
-    "— but the hook must NEVER overpromise what the clip delivers: platforms now "
+    "Each clip MUST: (1) OPEN with a hook in its VERY FIRST sentence that stops the "
+    "scroll within ~3 seconds. Completion rate is what triggers viral distribution "
+    "and it is decided in those first seconds, so open on the sharpest true line, "
+    "never the wind-up ('today we will talk about...'). "
+    "SOFT PREFERENCE, not a filter: when several moments are close, prefer an "
+    "opening that is a relatable callout (the viewer's own situation), a curiosity "
+    "gap (a question the clip has not answered yet), or high stakes (money, status, "
+    "career, a consequence on someone). A direct question, a controversy, or a bold "
+    "claim can still be the moment — do not discard a strong story because of its "
+    "opening — but when the same transcript can start on the scene or the stake "
+    "instead of the provocation, start there. "
+    "The hook must NEVER overpromise what the clip delivers: platforms now "
     "punish bait (early-exit is a negative ranking signal). Score highest when the "
     "hook is the first thing said, not buried after throat-clearing, and when the "
     "moment carries STRONG FIRST-PERSON OPINION LANGUAGE or an EMOTIONAL PEAK — "
@@ -90,10 +221,36 @@ CLIP_FIELDS = (
     "Strong: 'נציג התמיכה התקשר להתחנן שאפסיק - הוא לא ידע שהוא מתכתב עם AI'.\n"
     "hook_variants = exactly 2 "
     "ALTERNATE Hebrew hook lines for the same moment, each taking a DIFFERENT angle "
-    "from title (e.g. if title is a question, make one a bold claim and one a "
-    "surprising number/fact) — they are for A/B testing which opener holds viewers. "
-    "hook_type = one of question|bold_claim|surprise|emotion|story. score = 1-10 for "
-    "how strongly the OPENING stops the scroll. beats = the story's kept spans, in "
+    "from title. Prefer a relatable callout, a curiosity gap, or high stakes for "
+    "those alternates too — do not spend a variant on a direct question, a "
+    "controversy, or a bold claim when a story-first line from this moment exists. "
+    "They are for A/B testing which opener holds viewers. "
+    "hook_variant_types = the hook_type of each hook_variant, same order, same "
+    "allowed labels. "
+    "hook_type = exactly one of " + "|".join(HOOK_TYPES) + ". "
+    "Label the OPENING line, not the topic. "
+    "curiosity_gap = the opener withholds a payoff the clip then delivers. "
+    "relatable_callout = it names the viewer's own situation. "
+    "high_stakes = money, status, career, or a consequence that lands on someone. "
+    "pattern_interrupt = the first line breaks the expected rhythm. "
+    "bold_claim = a flat assertion with no open question. "
+    "question = it asks the viewer something directly. "
+    "controversy = the first line picks a fight or a villain. "
+    "middle_of_action = it starts mid-story, already inside the scene. "
+    "visual_spectacle = the picture, not the sentence, is the hook — rare in a "
+    "talking-head podcast; do not invent it. "
+    "other = none of those. "
+    "hook_reason = one short English line on why that label fits THIS opening. "
+    "When hook_type is question, controversy, or bold_claim, also set alt_opening "
+    "to a DIFFERENT Hebrew line copied VERBATIM from this transcript that could "
+    "open the same moment on the story or the stake instead of the provocation, "
+    "and alt_hook_type for that line (prefer relatable_callout, curiosity_gap, or "
+    "high_stakes). alt_opening is a suggestion for the human, never a replacement "
+    "for title. If the transcript has no such line, leave alt_opening empty. "
+    "Otherwise leave alt_opening empty. "
+    "score = 1-10 for how strongly the OPENING stops the scroll — score the "
+    "moment, and do not inflate or sink the score just to enforce the preference. "
+    "beats = the story's kept spans, in "
     'order: [{"quote_start": str, "quote_end": str}, ...] where quote_start is the '
     "first ~4 words of that span copied VERBATIM from the transcript and quote_end "
     "is its last ~4 words, VERBATIM. A single-span clip has one beat. For "
@@ -156,6 +313,8 @@ def performance_hint(path: str | None = None, n: int = 3,
             else f"{r['views']} views"
         if r.get("speaker"):
             m += f"; opens on {r['speaker']}"
+        if r.get("hook_type"):
+            m += f"; {r['hook_type']}"
         return f'  - "{r["hook"]}" ({m})'
 
     best = "\n".join(fmt(r) for r in rows[:n])
@@ -184,6 +343,17 @@ class Quote:
     # Alternate hook lines for the same moment, to A/B against the retention
     # curve. `text` stays the primary. Tuple so the default is safely immutable.
     variants: tuple[str, ...] = ()
+    # Parallel to `variants`: the hook_type of each alternate line. Empty when
+    # the model didn't label them, so an old reply still parses.
+    variant_types: tuple[str, ...] = ()
+    # Opening label for `text` (the primary hook). "" when this Quote was built
+    # without a classification (a hand-made range, an old pool file).
+    hook_type: str = ""
+    hook_reason: str = ""
+    # Suggested replacement opening for a flagged type, copied from the
+    # transcript. Empty when there isn't one, or the type isn't flagged.
+    alt_opening: str = ""
+    alt_hook_type: str = ""
     # The narrative edit: kept (start, end) spans in chronological order whose
     # union is the clip. One beat == a plain contiguous clip; 2+ beats mean the
     # filler between them is cut out at render time. start/end above stay the
@@ -439,13 +609,63 @@ def resolve_clip_item(item: dict, segments: list[Segment], audio_end: float,
 
     title = (item.get("title") or "").strip()
     # Alternate hooks are optional and model-supplied: keep only non-empty strings
-    # that differ from the primary, cap at 2.
-    variants = tuple(
-        v.strip() for v in (item.get("hook_variants") or [])
-        if isinstance(v, str) and v.strip() and v.strip() != title
-    )[:2]
+    # that differ from the primary, cap at 2. Types stay aligned with the lines
+    # that survived that cleanup; a missing list leaves them unlabeled.
+    variants_in = item.get("hook_variants") or []
+    types_in = item.get("hook_variant_types") or []
+    if not isinstance(types_in, list):
+        types_in = []
+    variants: list[str] = []
+    variant_types: list[str] = []
+    saw_type = False
+    if isinstance(variants_in, list):
+        for i, v in enumerate(variants_in):
+            if not isinstance(v, str) or not v.strip() or v.strip() == title:
+                continue
+            variants.append(v.strip())
+            raw_t = types_in[i] if i < len(types_in) else ""
+            if isinstance(raw_t, str) and raw_t.strip():
+                variant_types.append(normalize_hook_type(raw_t))
+                saw_type = True
+            else:
+                variant_types.append("")
+            if len(variants) == 2:
+                break
+    else:
+        variants = [
+            v.strip() for v in variants_in
+            if isinstance(v, str) and v.strip() and v.strip() != title
+        ][:2]
+    if not saw_type:
+        variant_types = []
+
+    hook_type = normalize_hook_type(item.get("hook_type"))
+    raw_why = item.get("hook_reason")
+    hook_reason = ""
+    if isinstance(raw_why, str) and raw_why.strip():
+        hook_reason = raw_why.strip().splitlines()[0].strip()[:200]
+
+    # Flagged openings keep a transcript-backed alternative when the model
+    # found one. A line that isn't actually in the episode is dropped; the
+    # candidate stays, and the human still picks.
+    alt_opening = ""
+    alt_hook_type = ""
+    if hook_type in FLAGGED_HOOK_TYPES:
+        raw_alt = item.get("alt_opening") or ""
+        if isinstance(raw_alt, str):
+            raw_alt = raw_alt.strip()
+        else:
+            raw_alt = ""
+        if raw_alt and raw_alt != title and opening_in_transcript(raw_alt, segments):
+            alt_opening = raw_alt
+            if item.get("alt_hook_type"):
+                alt_hook_type = normalize_hook_type(item.get("alt_hook_type"))
+
     return Quote(start=beats[0][0], end=beats[-1][1], text=title,
-                 variants=variants, beats=beats)
+                 variants=tuple(variants), variant_types=tuple(variant_types),
+                 hook_type=hook_type, hook_reason=hook_reason,
+                 alt_opening=alt_opening, alt_hook_type=alt_hook_type,
+                 beats=beats)
 
 
 def make_chapters(segments: list[Segment], max_chapters: int = 12, titler: str = "api") -> list[Chapter]:
@@ -597,8 +817,9 @@ def make_quotes(
     system = (
         "You select and EDIT scroll-stopping short-form clips from a Hebrew podcast "
         "(for Reels / TikTok / Shorts). " + CLIP_RULES + " Return ONLY a JSON array: "
-        '[{"title": str, "hook_type": str, "score": int, "beats": '
-        '[{"quote_start": str, "quote_end": str}], "hook_variants": [str, str]}]. '
+        '[{"title": str, "hook_type": str, "hook_reason": str, "score": int, "beats": '
+        '[{"quote_start": str, "quote_end": str}], "hook_variants": [str, str], '
+        '"hook_variant_types": [str, str], "alt_opening": str, "alt_hook_type": str}]. '
         + CLIP_FIELDS +
         " Only include clips you would score 7 or higher." + performance_hint()
     )
@@ -663,6 +884,18 @@ def clip_spec(q: Quote, segments: list[Segment], clip_id: str) -> dict:
         "hook_variants": list(q.variants),
         "focus": None,
     }
+    # Optional on purpose: a Quote built from an old pool has no label, and
+    # readers that predate hook_type must keep working.
+    if q.hook_type:
+        spec["hook_type"] = q.hook_type
+    if q.hook_reason:
+        spec["hook_reason"] = q.hook_reason
+    if q.alt_opening:
+        spec["alt_opening"] = q.alt_opening
+    if q.alt_hook_type:
+        spec["alt_hook_type"] = q.alt_hook_type
+    if any(q.variant_types):
+        spec["hook_variant_types"] = list(q.variant_types)
     beats = q.beats or ((q.start, q.end),)
     if len(beats) > 1:
         spec["segments"] = [
