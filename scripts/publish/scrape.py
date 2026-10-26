@@ -21,7 +21,9 @@ import datetime
 import json
 import os
 import re
+import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -125,9 +127,41 @@ def _publish_cfg() -> dict:
               file=_sys.stderr)
         return {}
 
+def _repo_sofit() -> Path:
+    return Path(__file__).resolve().parents[2] / ".venv" / "bin" / "sofit"
+
+
+def _sofit_bin_candidates() -> list[Path]:
+    """$SOFIT_BIN, the repo .venv, `sofit` on PATH, this interpreter's bin."""
+    cands: list[Path] = []
+    env = os.environ.get("SOFIT_BIN")
+    if env:
+        cands.append(Path(env).expanduser())
+    cands.append(_repo_sofit())
+    found = shutil.which("sofit")
+    if found:
+        cands.append(Path(found))
+    cands.append(Path(sys.executable).resolve().parent / "sofit")
+    return cands
+
+
+def _sofit_bin() -> Path:
+    """First existing sofit binary. A missing $SOFIT_BIN falls through.
+
+    A separate venv works when SOFIT_BIN points at it or `sofit` is on PATH.
+    When none of the candidates exist, the interpreter's bin path is returned
+    so a later call fails on a real command rather than a hard-coded path.
+    """
+    cands = _sofit_bin_candidates()
+    for cand in cands:
+        if cand.is_file():
+            return cand
+    return cands[-1]
+
+
 _CFG = _publish_cfg()
 IG_PROFILE = _CFG.get("ig_profile", "")
-SOFIT_BIN = Path(__file__).resolve().parents[2] / ".venv" / "bin" / "sofit"
+CLIPS_DIR = Path(_CFG.get("clips_dir", "~/Downloads")).expanduser()
 PLANS_DIR = Path(_CFG.get("plans_dir", "~/.sofit/plans")).expanduser()
 
 
@@ -228,81 +262,288 @@ def _tt_insight_extras(body: str) -> dict:
     return out
 
 
-def _pending_ig_posts(log_rows: list, today) -> list:
-    """Planned IG posts whose date has passed but no instagram row exists yet."""
+def _clip_base(clip: str | None) -> str:
+    """clip-18.pers / clip-5.hook1.pers -> clip-18 / clip-5.
+
+    Bare ids stay as they are. Bonus ids (pins, car.ab-accent-box) keep the
+    segment before the first dot.
+    """
+    if not clip:
+        return ""
+    stem = str(clip)
+    m = re.search(r"(clip-\d+)", stem)
+    if m:
+        return m.group(1)
+    return stem.split(".")[0]
+
+
+def _strip_bidi(text: str) -> str:
+    """Drop embedding and direction marks so a caption matches page text."""
+    for mark in ("\u202b", "\u202c", "\u200f", "\u200e"):
+        text = text.replace(mark, "")
+    return text
+
+
+def _canon_url(url: str | None) -> str:
+    return (url or "").split("?")[0].rstrip("/")
+
+
+def _skip_ig_plan(name: str) -> bool:
+    """Facebook schedules and YouTube-only plans are not Instagram queues."""
+    name = name.lower()
+    return "facebook" in name or name.endswith("-yt.json") or "ttyt" in name
+
+
+_DROPPED_STATES = frozenset({"cancelled", "canceled", "deleted"})
+
+
+def _status_word(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("status")
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().lower()
+    if not text:
+        return ""
+    return text.split()[0].strip(".,;:")
+
+
+def _dropped_state(value) -> bool:
+    return _status_word(value) in _DROPPED_STATES
+
+
+def _ig_post_dropped(post: dict) -> bool:
+    """True when this Instagram post was cancelled or deleted.
+
+    The post's own status covers every platform. An Instagram-only status
+    lives on instagram_status, under status["instagram"], or on a status
+    field inside the instagram object.
+    """
+    status = post.get("status")
+    if isinstance(status, str) and _dropped_state(status):
+        return True
+    if isinstance(status, dict) and _dropped_state(status.get("instagram")):
+        return True
+    if _dropped_state(post.get("instagram_status")):
+        return True
+    ig = post.get("instagram")
+    if isinstance(ig, dict) and _dropped_state(ig.get("status")):
+        return True
+    return False
+
+
+def _ig_logged(log_rows: list, episode, clip: str) -> bool:
+    """True when an instagram row already covers this post.
+
+    clip-5.hook1.pers and clip-5 are the same post: matching the full id only
+    logged the reel a second time whenever the plan named a variant.
+    """
+    base = _clip_base(clip)
+    return any(r.get("episode") == episode and r.get("platform") == "instagram"
+               and (_clip_base(r.get("clip")) == base or r.get("clip") == clip)
+               for r in log_rows)
+
+
+def _probe_duration(path: Path) -> float | None:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=15)
+        return round(float(out.stdout.strip()), 2)
+    except Exception:  # noqa: BLE001 - duration is best-effort
+        return None
+
+
+def _pending_ig_posts(log_rows: list, today,
+                      now: datetime.datetime | None = None) -> list:
+    """Planned IG posts whose slot has passed but no instagram row exists yet.
+
+    A post dated today stays queued until time_local (default 13:00).
+    Cancelled and deleted posts are not waiting to go live. Log rows match
+    on the base clip id, and the same episode+base pair is queued once.
+    """
     pending = []
+    seen = set()
+    clock = now or datetime.datetime.now()
     for plan_path in sorted(PLANS_DIR.glob("publish-plan-*.json")):
+        if _skip_ig_plan(plan_path.name):
+            continue
         try:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        for post in plan.get("posts", []):
+        if not isinstance(plan, dict):
+            continue
+        time_local = plan.get("time_local") or "13:00"
+        episode = plan.get("episode")
+        posts = plan.get("posts") or []
+        if not episode or not isinstance(posts, list):
+            continue
+        for post in posts:
+            if not isinstance(post, dict):
+                continue
+            caption = post.get("instagram")
+            if not isinstance(caption, str) or not caption:
+                continue
+            clip = post.get("clip")
+            if not clip:
+                continue
+            if _ig_post_dropped(post):
+                continue
             try:
                 posted = datetime.date.fromisoformat(post["date"])
             except (KeyError, ValueError):
                 continue
             if posted > today:
                 continue
-            if any(r.get("clip") == post["clip"]
-                   and r.get("episode") == plan.get("episode")
-                   and r.get("platform") == "instagram" for r in log_rows):
+            # Same calendar day: pending only once the local slot has arrived.
+            if posted == today:
+                try:
+                    hh, mm = [int(x) for x in str(time_local).split(":")[:2]]
+                    if clock.time() < datetime.time(hh, mm):
+                        continue
+                except ValueError:
+                    pass
+            if _ig_logged(log_rows, episode, clip):
                 continue
-            head = " ".join((post.get("instagram") or "").split())[:40]
+            base = _clip_base(clip)
+            key = (episode, base or clip)
+            if key in seen:
+                continue
+            seen.add(key)
+            head = " ".join(_strip_bidi(caption).split())[:40]
             if head:
-                pending.append({"episode": plan["episode"], "clip": post["clip"],
-                                "head": head})
+                pending.append({"episode": episode, "clip": clip, "head": head,
+                                "date": post["date"], "speaker": post.get("speaker"),
+                                "time_local": time_local})
     return pending
 
 
-def _discover_live_ig_reels(page, log_rows: list, today: datetime.date) -> list:
-    """Scheduled IG reels have no URL until they go live. Once a planned post's
-    date has passed and no instagram row exists for it yet, find the live reel
-    on the profile by caption match and publish-log it (which brings hook,
-    variant, duration and the duplicate guard for free)."""
-    import subprocess
+def _ig_reel_row(post: dict, log_rows: list, url: str,
+                 today: datetime.date) -> dict | None:
+    """Performance-log row for a reel that just went live.
 
+    The plan date is kept on purpose. Hook, variant, and duration come from
+    the sibling TikTok/YouTube row (matched on the base clip id). None when
+    that sibling has no hook: a row without one cannot be attributed.
+    """
+    clip = post["clip"]
+    base = _clip_base(clip)
+    episode = post["episode"]
+    sib = next((r0 for r0 in log_rows
+                if r0.get("episode") == episode
+                and (_clip_base(r0.get("clip")) == base or r0.get("clip") == clip)
+                and r0.get("hook")), None)
+    hook = (sib or {}).get("hook")
+    if not hook:
+        return None
+    speaker = (post.get("speaker") or (sib or {}).get("speaker")
+               or next((r0.get("speaker") for r0 in log_rows
+                        if r0.get("episode") == episode
+                        and (_clip_base(r0.get("clip")) == base
+                             or r0.get("clip") == clip)
+                        and r0.get("speaker")), None))
+    row = {
+        "date": post.get("date") or today.isoformat(),
+        "episode": episode,
+        "clip": base or clip,
+        "variant": (sib or {}).get("variant", 0),
+        "platform": "instagram",
+        "hook": hook,
+        "post_url": url,
+    }
+    if speaker:
+        row["speaker"] = speaker
+    if post.get("time_local"):
+        row["time_local"] = post["time_local"]
+    if (sib or {}).get("hook_style"):
+        row["hook_style"] = sib["hook_style"]
+    if ".pers" in str(clip):
+        row["hook_style"] = "persistent"
+    if (sib or {}).get("duration"):
+        row["duration"] = sib["duration"]
+    else:
+        video = CLIPS_DIR / f"{episode}_{clip}.mp4"
+        if not video.is_file():
+            video = CLIPS_DIR / f"{episode}_{base}.mp4"
+        if video.is_file():
+            dur = _probe_duration(video)
+            if dur is not None:
+                row["duration"] = dur
+    return row
+
+
+def _discover_live_ig_reels(page, log_rows: list, today: datetime.date) -> list:
+    """Find a planned reel on the profile and append its performance-log row.
+
+    The row is written here, not via `sofit publish-log`, so the plan date
+    sticks. publish-log stamps today, which pushes the T+3 metrics pass out
+    by however many days the discovery ran late.
+    """
     pending = _pending_ig_posts(log_rows, today)
     if not pending:
         return []
 
     logged = []
+    still_missing: list = []
     try:
         page.goto(f"https://www.instagram.com/{IG_PROFILE}/reels/",
                   wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(7_000)
+        # The grid lazy-loads; a short scroll reaches the recent tiles.
+        for _ in range(4):
+            page.mouse.wheel(0, 4000)
+            page.wait_for_timeout(1500)
         links = page.eval_on_selector_all(
             "a[href*='/reel/']", "els => [...new Set(els.map(e => e.href))]")
-        for url in links[:10]:
+        known = {_canon_url(r.get("post_url"))
+                 for r in log_rows if r.get("post_url")}
+        for url in links[:30]:
             if not pending:
                 break
+            clean = _canon_url(url) + "/"
+            if _canon_url(url) in known:
+                continue
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 page.wait_for_timeout(5_000)
                 body = " ".join(page.inner_text("body").split())
+                body_norm = _strip_bidi(body)
             except Exception:  # noqa: BLE001
                 continue
             for p in list(pending):
-                if p["head"] in body:
-                    video = (Path.home() / "Downloads"
-                             / f"{p['episode']}_{p['clip']}.mp4")
-                    cmd = [str(SOFIT_BIN), "publish-log", str(video),
-                           "--episode", p["episode"], "--platform", "instagram",
-                           "--url", url.split("?")[0]]
-                    # Carry the speaker over from this clip's existing row
-                    # (usually the TikTok one, logged at schedule time).
-                    spk = next((r0.get("speaker") for r0 in log_rows
-                                if r0.get("clip") == p["clip"]
-                                and r0.get("episode") == p["episode"]
-                                and r0.get("speaker")), None)
-                    if spk:
-                        cmd += ["--speaker", spk]
-                    r = subprocess.run(cmd, capture_output=True, text=True,
-                                       timeout=60)
-                    if r.returncode == 0:
-                        logged.append({"clip": p["clip"], "url": url.split("?")[0]})
+                head = p["head"]
+                if head not in body and head not in body_norm:
+                    continue
+                row = _ig_reel_row(p, log_rows, clean, today)
+                if row is None:
+                    print(f"warn: no hook for {p['episode']} {p['clip']} - skip",
+                          file=sys.stderr)
                     pending.remove(p)
+                    break
+                # Same guard publish-log uses: one URL is one row.
+                if any(_canon_url(r0.get("post_url")) == _canon_url(clean)
+                       for r0 in log_rows):
+                    pending.remove(p)
+                    break
+                with PERF_LOG.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                log_rows.append(row)
+                logged.append({"clip": row["clip"], "url": clean,
+                               "episode": p["episode"], "date": row["date"]})
+                known.add(_canon_url(clean))
+                pending.remove(p)
+                break
+        still_missing = pending
     except Exception as e:  # noqa: BLE001
         print(f"warn: live-reel discovery failed ({e})", file=sys.stderr)
+        still_missing = pending
+    if still_missing:
+        print("warn: ig posts still missing after discovery: "
+              + ", ".join(f"{p['episode']}/{p['clip']}({p.get('date')})"
+                          for p in still_missing[:20]),
+              file=sys.stderr)
     return logged
 
 
@@ -429,10 +670,12 @@ def main() -> int:
             # YT Studio serves a stripped page to HeadlessChrome UAs, so every
             # youtube row came back with no metrics (2026-08-28: 18 failures,
             # an empty youtube ranking). upload_youtube.py already overrode the
-            # UA; the scraper never did.
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/140.0.0.0 Safari/537.36",
+            # UA; the scraper never did. WS_SCRAPER_UA overrides the default
+            # when the host browser's build is not this one.
+            user_agent=(os.environ.get("WS_SCRAPER_UA")
+                        or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/140.0.0.0 Safari/537.36"),
             viewport={"width": 1400, "height": 900})
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
@@ -671,8 +914,15 @@ def main() -> int:
     ab_dims = sorted({k for r in lines for k in r if k.startswith("ab_")})
     by_ab = {d: metric_cells(lines, d, "control") for d in ab_dims}
 
+    # None = that platform had nothing due, so its session was not checked.
+    # TikTok only reaches this print when its session is live.
+    sessions = {"tiktok": True,
+                "instagram": ig_ok if ig_due else None,
+                "linkedin": li_ok if li_due else None,
+                "youtube": yt_ok if yt_due else None}
     print(json.dumps({
         "status": "ok", "updated": len(updated), "failed": len(failures),
+        "sessions": sessions, "due": len(due),
         "new_live_reels": newly_logged,
         "failed_urls": failures[:5],
         "rank_by": RANK_BY, "noise_band": NOISE_BAND,
