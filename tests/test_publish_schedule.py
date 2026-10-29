@@ -5,6 +5,7 @@ the decisions that can be wrong without one: date and time labels, the
 readback comparison, mention/hashtag splitting, and the dry/submit gates.
 """
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -104,6 +105,65 @@ def test_split_mentions_picks_handles_and_skips_emails():
     body, _tags = tt.split_tags("see @tortsuk\n\n#tag @not_in_body")
     mentions = [h for kind, h in tt.split_mentions(body) if kind == "mention"]
     assert mentions == ["tortsuk"]
+
+
+def test_hebrew_prefix_glued_to_a_handle_is_flagged():
+    # "ו@tortsuk" is invisible to split_mentions, so it must be caught here.
+    assert tt.glued_mentions("נבות מתלהב, ו@tortsuk מזכירה") == ["tortsuk"]
+    assert tt.glued_mentions("מסביר ל@tortsuk ש@navotvolk") == [
+        "tortsuk", "navotvolk"]
+    assert tt.split_mentions("ו@tortsuk")[0] == ("text", "ו@tortsuk")
+    # The hyphenated form is a real mention and is not flagged.
+    assert tt.glued_mentions("נבות מתלהב, ו-@tortsuk מזכירה") == []
+    assert ("mention", "tortsuk") in tt.split_mentions("ו-@tortsuk מזכירה")
+    # Plain mentions and emails are left alone.
+    assert tt.glued_mentions("hi @tortsuk, mail user@domain.com") == []
+    # Prefix letters TikTok fails to split, and a too-short handle (same
+    # shape as split_mentions) is not reported as a mention.
+    for prefix in "ושלבמכה":
+        assert tt.glued_mentions(f"{prefix}@tortsuk") == ["tortsuk"]
+    assert tt.glued_mentions("ב@ab") == []
+    refused = tt.glued_mention_refusal("נבות מתלהב, ו@tortsuk מזכירה")
+    assert refused["status"] == "refused_glued_mention"
+    assert refused["handles"] == ["tortsuk"]
+    assert "ו-@handle" in refused["hint"]
+    assert tt.glued_mention_refusal("ו-@tortsuk מזכירה") is None
+    assert tt.glued_mention_refusal("hi @tortsuk") is None
+
+
+def test_glued_mention_refuses_before_the_browser(tmp_path, capsys, monkeypatch):
+    plan_path = tmp_path / "plan.json"
+    monkeypatch.setattr(tt, "CLIPS_DIR", tmp_path)
+
+    def run(caption: str, mode: str) -> tuple[int, str]:
+        plan_path.write_text(json.dumps({
+            "episode": "ep",
+            "time_local": "20:00",
+            "posts": [{"clip": "clip-12", "tiktok": caption}],
+        }), encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", [
+            "upload_tiktok", "--clip", "clip-12", "--plan", str(plan_path), mode])
+        code = tt.main()
+        return code, capsys.readouterr().out
+
+    code, out = run("נבות מתלהב, ו@tortsuk מזכירה", "--dry")
+    assert code == 8
+    payload = json.loads(out)
+    assert payload["status"] == "refused_glued_mention"
+    assert payload["clip"] == "clip-12"
+    assert payload["handles"] == ["tortsuk"]
+    assert "ו-@handle" in payload["hint"]
+
+    code, out = run("מסביר ל@tortsuk ש@navotvolk\n\n#fyp", "--submit")
+    assert code == 8
+    assert json.loads(out)["handles"] == ["tortsuk", "navotvolk"]
+
+    # Hyphenated form passes the pre-check and stops on the missing video,
+    # still before Playwright starts.
+    code, out = run("נבות מתלהב, ו-@tortsuk מזכירה", "--submit")
+    assert code == 1
+    assert out == ""
+    assert not (tmp_path / "ep_clip-12.mp4").exists()
 
 
 def test_bidi_stripped_body_and_url_needle():
