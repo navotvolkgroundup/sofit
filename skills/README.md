@@ -18,6 +18,7 @@ Then invoke them by name, e.g. `/sofit-clips`.
 | `sofit-clips` | suggest → pick → render captioned 9:16 social clips |
 | `sofit-captions` | fix caption typos, timing-preserving, then re-render |
 | `sofit-trim` | cut a moment out of a finished clip |
+| `sofit-seo` | monthly SEO playbook refresh + full-episode upload to YouTube and Spotify for Creators |
 
 **Personalize before use.** Each `SKILL.md` has a `Home` block with absolute paths for one
 setup (`HC=` the repo/venv, `LOGO=` the show wordmark). Edit those to match your machine.
