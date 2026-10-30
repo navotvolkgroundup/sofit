@@ -686,11 +686,16 @@ def main() -> int:
         def upload_done() -> bool:
             return not page.get_by_text("Checks can only start after the file is uploaded").count()
 
-        def retry_upload_inline(rounds: int = 2) -> bool:
+        def retry_upload_inline(rounds: int = 5) -> bool:
             # 2026-10-22: TikTok's chunk upload to tos-*.tiktokcdn.com fails
             # intermittently ("Couldn't upload"). The card has its own Retry
             # button (NOT a submit); use it in place with spacing, rather than
             # re-running the whole page.
+            # 5 rounds, not 2: at the observed 31-42% success per attempt, 3
+            # total attempts land ~78% of the time and 6 land ~95%. The backoff
+            # below is 20s + 20s*r, so the extra rounds cost waiting, never a
+            # second post — Retry is not a submit, and --submit still gates on
+            # upload_done().
             for r in range(rounds):
                 if not upload_failed() and not page.get_by_text("Upload failed").count():
                     break
