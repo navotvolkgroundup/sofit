@@ -17,8 +17,11 @@ Shorts); optional "youtube_description" fills the description box.
 
 `--clip episode` is the full long-form episode ({episode}_episode.mp4): it
 also gets the 16:9 thumbnail ("thumbnail" key, default
-{episode}_episode-cover.jpg), and --submit refuses it unless seo.check passes
-and the Tags box reads back committed.
+{episode}_episode-cover.jpg). --submit refuses it unless seo.check passes,
+the schedule read back, the Tags counter is at least ~80% of the planned
+text, and the thumbnail landed. A dry run reports those same fields and is
+not `dry_ok` when submit would refuse. The browser stays open until the
+upload and the checks have finished; a Short is unchanged.
 """
 import argparse
 import json
@@ -26,8 +29,6 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-
-from playwright.sync_api import sync_playwright
 
 PROFILE = Path.home() / ".ws-scraper" / "profile"
 
@@ -62,6 +63,239 @@ def _date_label(iso: str) -> str:
     return datetime.strptime(iso, "%Y-%m-%d").strftime("%b %-d, %Y")
 
 
+# Shorts keep the labels the commit loop has always clicked. A long-form
+# episode must not click Publish: that is "public now" when the schedule
+# did not stick.
+SHORTS_COMMIT_LABELS = ("Schedule", "Save", "Publish")
+LONG_FORM_COMMIT_LABELS = ("Schedule", "Save")
+
+# YouTube custom thumbnails must be under 2 MB.
+THUMB_MAX_BYTES = 2 * 1024 * 1024
+# The tags box commits on commas, and we type at most this many characters
+# (the field's counter stops at 500).
+TAG_TYPE_CAP = 495
+TAG_COMMIT_RATIO = 0.8
+
+_UPLOAD_DONE = re.compile(
+    r"(?i)upload complete|finished uploading|"
+    r"processing (?:will begin|sd|hd)|(?:sd|hd) version")
+_CHECKS_DONE = re.compile(r"(?i)checks complete|check complete|no issues found")
+_STILL_UPLOADING = re.compile(r"(?i)\buploading\b")
+_STILL_CHECKING = re.compile(r"(?i)\bchecking\b|running checks")
+
+
+def commit_labels(long_form: bool) -> tuple[str, ...]:
+    return LONG_FORM_COMMIT_LABELS if long_form else SHORTS_COMMIT_LABELS
+
+
+def tags_committed_enough(planned: str, committed: int, cap: int = TAG_TYPE_CAP) -> bool:
+    """True when the Tags counter is not clearly short of what we typed.
+
+    Zero committed tags is a refusal. So is anything under ~80% of the
+    planned tag text (or of the 495 characters we actually type, when the
+    plan is longer than that). The counter is characters, not chips.
+    """
+    target = min(len(planned or ""), cap)
+    if target <= 0:
+        return False
+    # Integer comparison for `committed >= target * 0.8` (exactly 80% passes).
+    return committed * 5 >= target * 4
+
+
+def youtube_schedule_readback_ok(review_text: str, time_value: str,
+                                 date_iso: str, want_time: str) -> tuple[bool, bool]:
+    """(date_ok, time_ok) for a long-form visibility step.
+
+    The month and day without the year is not enough: "Aug 23" matches a
+    different year. `want_time` is the Studio list label ("8:30 PM"); the
+    time input is accepted too, after the narrow no-break space YouTube
+    puts before AM/PM is normalized.
+    """
+    def norm(s: str) -> str:
+        return " ".join((s or "").replace("\u202f", " ").replace("\u00a0", " ").split())
+
+    text = norm(review_text)
+    label = norm(_date_label(date_iso))
+    date_ok = label in text
+    want = norm(want_time)
+    time_ok = want in text or norm(time_value) == want
+    return date_ok, time_ok
+
+
+def thumbnail_precheck(exists: bool, size: int,
+                       limit: int = THUMB_MAX_BYTES) -> str | None:
+    """None when the file may be sent. Otherwise a short reason.
+
+    YouTube rejects a custom thumbnail that is not under 2 MB. An empty
+    file is not a thumbnail either.
+    """
+    if not exists:
+        return "missing"
+    if size >= limit:
+        return "over_2mb"
+    if size <= 0:
+        return "empty"
+    return None
+
+
+def thumbnail_landed(before_src: str | None, after_src: str | None,
+                     component_text: str) -> bool:
+    """The thumbnail uploader's image changed, and it did not report an error."""
+    if re.search(r"(?i)(couldn.?t upload|upload failed|too (?:large|big)|file is too)",
+                 component_text or ""):
+        return False
+    after = (after_src or "").strip()
+    if not after:
+        return False
+    return after != (before_src or "").strip()
+
+
+def youtube_progress_flags(text: str) -> tuple[bool, bool, bool]:
+    """(upload_complete, checks_complete, still_working) from dialog text.
+
+    "Processing" without "Uploading" means the file has finished transferring.
+    Checks stay open while the dialog still says it is checking.
+    """
+    t = text or ""
+    upload_complete = bool(_UPLOAD_DONE.search(t)) or (
+        bool(re.search(r"(?i)\bprocessing\b", t)) and not _STILL_UPLOADING.search(t))
+    checks_complete = bool(_CHECKS_DONE.search(t))
+    uploading = bool(_STILL_UPLOADING.search(t)) and not upload_complete
+    checking = bool(_STILL_CHECKING.search(t)) and not checks_complete
+    return upload_complete, checks_complete, uploading or checking
+
+
+def youtube_safe_to_close(text: str, *, saw_upload_complete: bool,
+                          saw_checks_complete: bool) -> bool:
+    """A long-form submit may close only after the file and the checks are done.
+
+    The share panel ("Video scheduled") often no longer shows those words, so
+    a flag recorded earlier on the dialog counts. A panel that is still
+    uploading does not, even if an earlier sample looked finished. Absence of
+    a progress bar is not evidence: the old 5-minute loop closed on that and
+    dropped multi-GB uploads.
+    """
+    upload_complete, checks_complete, still = youtube_progress_flags(text)
+    if still:
+        return False
+    return ((upload_complete or saw_upload_complete)
+            and (checks_complete or saw_checks_complete))
+
+
+def youtube_long_form_blocker(*, seo_problems: list[str], tags_planned: str,
+                              tags_committed: int, date_ok: bool, time_ok: bool,
+                              thumbnail_set: bool) -> str | None:
+    """Status a long-form submit must refuse with, or None if it may schedule.
+
+    Shorts do not use this. Order matches the submit path: the SEO gate, then
+    the schedule readback, then tags, then the thumbnail.
+    """
+    if seo_problems:
+        return "seo_refused"
+    if not date_ok or not time_ok:
+        return "schedule_readback_refused"
+    if not tags_committed_enough(tags_planned, tags_committed):
+        return "tags_not_committed"
+    if not thumbnail_set:
+        return "thumbnail_not_set"
+    return None
+
+
+def youtube_refusal_code(blocker: str | None) -> int:
+    """Exit code for a long-form refusal. 0 when there is nothing to refuse.
+
+    SEO and tags stay on 7 (the code the skill already treats as a gate
+    refusal). Schedule, thumbnail, and an unfinished upload stay on 6.
+    """
+    if blocker is None:
+        return 0
+    if blocker in ("seo_refused", "tags_not_committed"):
+        return 7
+    return 6
+
+
+def youtube_dry_decision(long_form: bool, blocker: str | None) -> tuple[str, int]:
+    """Dry-run status and exit code.
+
+    A Short is `dry_ok` / 0, as before. A long-form dry run is not ok when
+    submit would refuse — an exit code of 0 there used to hide a failed SEO
+    gate, an empty tags box, or a thumbnail that never landed.
+    """
+    if not long_form:
+        return "dry_ok", 0
+    if blocker is None:
+        return "dry_ok", 0
+    return "dry_refused", youtube_refusal_code(blocker)
+
+
+def _dialog_text(page) -> str:
+    try:
+        dlg = page.locator("ytcp-uploads-dialog")
+        if dlg.count():
+            return dlg.first.inner_text(timeout=5_000)
+    except Exception:  # noqa: BLE001 - the dialog can detach mid-read
+        pass
+    try:
+        return page.inner_text("body")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _note_progress(page, seen: dict) -> str:
+    text = _dialog_text(page)
+    upload_done, checks_done, _still = youtube_progress_flags(text)
+    seen["upload"] = bool(seen.get("upload")) or upload_done
+    seen["checks"] = bool(seen.get("checks")) or checks_done
+    if text:
+        seen["excerpt"] = text[:300]
+    return text
+
+
+def _wait_for_checks(page, seen: dict, *, rounds: int = 80,
+                     pause_ms: int = 15_000) -> bool:
+    """Stay on the checks step until it reports done, or the budget runs out."""
+    for i in range(rounds):
+        _note_progress(page, seen)
+        if seen["checks"]:
+            return True
+        if i % 4 == 0:
+            print(f"waiting for checks to finish ({i * pause_ms // 1000}s)",
+                  file=sys.stderr)
+        page.wait_for_timeout(pause_ms)
+    return False
+
+
+def _wait_for_youtube_settle(page, seen: dict, *, rounds: int,
+                             pause_ms: int = 15_000) -> bool:
+    """Poll until the file has uploaded and the checks have finished."""
+    for i in range(rounds):
+        text = _note_progress(page, seen)
+        if youtube_safe_to_close(
+                text, saw_upload_complete=seen["upload"],
+                saw_checks_complete=seen["checks"]):
+            return True
+        if i % 4 == 0:
+            print(f"waiting for the upload and checks to finish "
+                  f"({i * pause_ms // 1000}s)", file=sys.stderr)
+        page.wait_for_timeout(pause_ms)
+    return False
+
+
+def _upload_not_settled(seen: dict, shot: str, *, scheduled: bool) -> dict:
+    why = ("Schedule was not clicked"
+           if not scheduled else
+           "Schedule may already have been clicked; do not re-submit until "
+           "Studio shows this upload failed")
+    return {
+        "status": "upload_not_settled",
+        "screenshot": shot,
+        "excerpt": seen.get("excerpt", ""),
+        "saw_upload_complete": bool(seen.get("upload")),
+        "saw_checks_complete": bool(seen.get("checks")),
+        "why": why,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--login", action="store_true",
@@ -74,6 +308,7 @@ def main() -> int:
     ap.add_argument("--shot", default="/tmp/youtube-upload-preview.png")
     args = ap.parse_args()
 
+    from playwright.sync_api import sync_playwright  # lazy: tests import this file
     with sync_playwright() as p:
         # AutomationControlled off or Google bot-gates the login flow
         # ("this browser may not be secure") - same lesson as scrape.py.
@@ -129,6 +364,7 @@ def main() -> int:
         # without tags, hashtags and chapters. Dry shows the problems, submit
         # refuses them.
         long_form = args.clip == "episode"
+        problems: list[str] = []
         if long_form:
             import seo
             problems = seo.check("youtube", " ".join(post["youtube"].split()),
@@ -169,21 +405,51 @@ def main() -> int:
             page.keyboard.insert_text(desc)
 
         # Long-form gets the approved 16:9 episode cover (Shorts have no custom
-        # thumbnail). Best effort: the upload stands without it, but say so.
-        thumb = Path(post.get("thumbnail") or
-                     CLIPS_DIR / f"{plan['episode']}_episode-cover.jpg").expanduser()
-        if long_form and thumb.exists():
-            try:
-                page.set_input_files("ytcp-thumbnails-compact-editor-uploader "
-                                     "input[type=file], input#file-loader",
-                                     str(thumb), timeout=10_000)
-                page.wait_for_timeout(3_000)
-                print(f"thumbnail: {thumb.name}", file=sys.stderr)
-            except Exception as e:  # noqa: BLE001
-                print(f"warn: thumbnail not set ({str(e)[:80]}) - add it by hand",
+        # thumbnail). The file input is the one inside the thumbnail uploader.
+        # `input#file-loader` is not used: it is unprobed and can be the video
+        # file input. A file that is not under 2 MB is not sent.
+        thumbnail_set = False
+        thumb_note = "skipped"
+        if long_form:
+            thumb = Path(post.get("thumbnail") or
+                         CLIPS_DIR / f"{plan['episode']}_episode-cover.jpg").expanduser()
+            thumb_note = thumbnail_precheck(thumb.exists(),
+                                            thumb.stat().st_size if thumb.exists() else 0)
+            if thumb_note:
+                print(f"warn: thumbnail not set ({thumb_note}: {thumb})",
                       file=sys.stderr)
-        elif long_form:
-            print(f"warn: no thumbnail ({thumb} missing)", file=sys.stderr)
+                thumbnail_set = False
+            else:
+                try:
+                    comp = page.locator("ytcp-thumbnails-compact-editor-uploader")
+                    file_input = comp.locator("input[type=file]")
+                    if comp.count() == 0 or file_input.count() == 0:
+                        thumb_note = "uploader_not_found"
+                        thumbnail_set = False
+                    else:
+                        imgs = comp.locator("img")
+                        before = imgs.first.get_attribute("src") if imgs.count() else ""
+                        file_input.first.set_input_files(str(thumb), timeout=10_000)
+                        page.wait_for_timeout(3_000)
+                        imgs = comp.locator("img")
+                        after = imgs.first.get_attribute("src") if imgs.count() else ""
+                        err = ""
+                        try:
+                            err = comp.inner_text(timeout=3_000)
+                        except Exception:  # noqa: BLE001
+                            err = ""
+                        thumbnail_set = thumbnail_landed(before, after, err)
+                        thumb_note = "set" if thumbnail_set else "not_confirmed"
+                    if thumbnail_set:
+                        print(f"thumbnail: {thumb.name}", file=sys.stderr)
+                    else:
+                        print(f"warn: thumbnail not set ({thumb_note})",
+                              file=sys.stderr)
+                except Exception as e:  # noqa: BLE001
+                    thumbnail_set = False
+                    thumb_note = "error"
+                    print(f"warn: thumbnail not set ({str(e)[:80]})",
+                          file=sys.stderr)
 
         # Tags live behind "Show more" and were never filled - the pipeline has
         # generated them since 2026-09-24 and they went nowhere (Navot,
@@ -209,7 +475,7 @@ def main() -> int:
                 # A chip input commits a tag on each comma KEYSTROKE, so a paste
                 # leaves the counter at 0/500 - the same reason TikTok hashtags
                 # came out dead. type() is slower and is the only thing that works.
-                box.type(tags[:495], delay=2)
+                box.type(tags[:TAG_TYPE_CAP], delay=2)
                 page.wait_for_timeout(1_500)
                 # The counter is the only honest readback: it reflects committed
                 # chips, not what we typed.
@@ -217,9 +483,11 @@ def main() -> int:
                     "el => el.closest('ytcp-form-input-container').innerText")
                 used = re.search(r"(\d+)\s*/\s*500", got)
                 n = tags_committed = int(used.group(1)) if used else 0
-                print(f"tags: {n}/500 chars committed"
-                      f"{'' if n > 100 else '  <-- EMPTY, fill them by hand'}",
-                      file=sys.stderr)
+                if long_form:
+                    flag = "" if tags_committed_enough(tags, n) else "  <-- short of the plan"
+                else:
+                    flag = "" if n > 100 else "  <-- EMPTY, fill them by hand"
+                print(f"tags: {n}/500 chars committed{flag}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 print(f"warn: tags not set ({str(e)[:80]})", file=sys.stderr)
 
@@ -227,9 +495,22 @@ def main() -> int:
             "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']"
         ).click(timeout=15_000)
 
-        for _ in range(3):  # ad suitability / video elements / checks
-            page.locator("#next-button").click(timeout=15_000)
-            page.wait_for_timeout(1_200)
+        # Samples of the dialog, so a later step can remember "upload complete"
+        # after the share panel has replaced that text. Shorts don't read it.
+        seen = {"upload": False, "checks": False, "excerpt": ""}
+        if long_form and args.submit:
+            # The third Next leaves the checks step. Wait there first so the
+            # "checks complete" line is still on screen to be recorded.
+            for i in range(3):
+                if i == 2:
+                    _wait_for_checks(page, seen)
+                page.locator("#next-button").click(timeout=15_000)
+                page.wait_for_timeout(1_200)
+                _note_progress(page, seen)
+        else:
+            for _ in range(3):  # ad suitability / video elements / checks
+                page.locator("#next-button").click(timeout=15_000)
+                page.wait_for_timeout(1_200)
 
         # "Schedule" is an expander section on the Visibility step (not a
         # radio): open it, then the date/time triggers render inside.
@@ -265,13 +546,42 @@ def main() -> int:
                   f"'{_date_label(post['date'])} {want_time}'", file=sys.stderr)
 
         page.screenshot(path=args.shot, full_page=False)
-        # The counter, not the plan, says whether the episode has tags.
-        if long_form and args.submit and not tags_committed:
-            print(json.dumps({"status": "tags_not_committed", "screenshot": args.shot,
-                              "fix": "the Tags box read 0/500 - fill it by hand"}))
-            ctx.close()
-            return 7
-        if args.dry:
+        if long_form:
+            # Month and day without the year is the warning above. The
+            # refusal uses the full date label, so a wrong year does not pass.
+            strict_date, strict_time = youtube_schedule_readback_ok(
+                vis_text, tin.input_value(), post["date"], want_time)
+            blocker = youtube_long_form_blocker(
+                seo_problems=problems, tags_planned=tags,
+                tags_committed=tags_committed, date_ok=strict_date,
+                time_ok=strict_time, thumbnail_set=thumbnail_set)
+            report = {
+                "screenshot": args.shot, "clip": args.clip,
+                "date": post["date"], "time": want_time,
+                "seo_problems": problems, "tags_committed": tags_committed,
+                "tags_planned": len(tags or ""), "thumbnail_set": thumbnail_set,
+                "thumbnail_note": thumb_note, "date_ok": strict_date,
+                "time_ok": strict_time, "would_refuse": blocker,
+            }
+            if args.dry:
+                status, code = youtube_dry_decision(True, blocker)
+                print(json.dumps({"status": status, **report}, ensure_ascii=False))
+                ctx.close()
+                return code
+            if blocker:
+                print(json.dumps({"status": blocker, **report}, ensure_ascii=False))
+                ctx.close()
+                return youtube_refusal_code(blocker)
+            # A multi-GB episode is still uploading long after the form is
+            # filled. Schedule only once the dialog has said the file and the
+            # checks are done; closing earlier drops the upload.
+            if not _wait_for_youtube_settle(page, seen, rounds=720):
+                page.screenshot(path=args.shot, full_page=False)
+                print(json.dumps(_upload_not_settled(seen, args.shot, scheduled=False),
+                                 ensure_ascii=False))
+                ctx.close()
+                return 6
+        elif args.dry:
             print(json.dumps({"status": "dry_ok", "screenshot": args.shot,
                               "clip": args.clip, "date": post["date"],
                               "time": want_time}, ensure_ascii=False))
@@ -290,14 +600,15 @@ def main() -> int:
         # panel hasn't appeared (the first click can land while the button
         # is still settling), and only report submitted on the panel itself.
         committed = False
+        labels = list(commit_labels(long_form))
         for _ in range(30):  # up to ~5 min
             page.evaluate(
-                """() => { const d=document.querySelector('ytcp-uploads-dialog');
+                """(labels) => { const d=document.querySelector('ytcp-uploads-dialog');
                    if(!d) return;
                    const vis=e=>!!(e.offsetWidth||e.offsetHeight);
                    const b=[...d.querySelectorAll('button')].filter(vis).find(
-                     x=>['Schedule','Save','Publish'].includes(x.innerText.trim()));
-                   if(b && !b.disabled) b.click(); }""")
+                     x=>labels.includes(x.innerText.trim()));
+                   if(b && !b.disabled) b.click(); }""", labels)
             page.wait_for_timeout(10_000)
             if (page.get_by_text("Video scheduled").count()
                     or page.get_by_text("Video published").count()
@@ -312,6 +623,17 @@ def main() -> int:
                               "screenshot": args.shot}, ensure_ascii=False))
             ctx.close()
             return 6
+        if long_form and not youtube_safe_to_close(
+                _dialog_text(page), saw_upload_complete=seen["upload"],
+                saw_checks_complete=seen["checks"]):
+            # The share panel can hide the progress line. If it is still
+            # uploading, keep the browser open instead of dropping the file.
+            if not _wait_for_youtube_settle(page, seen, rounds=720):
+                page.screenshot(path=args.shot, full_page=False)
+                print(json.dumps(_upload_not_settled(seen, args.shot, scheduled=True),
+                                 ensure_ascii=False))
+                ctx.close()
+                return 6
         # Dismiss the share panel with its VISIBLE Close button only - a
         # role-based lookup matches the wizard's hidden "Save and close".
         page.evaluate(

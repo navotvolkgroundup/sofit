@@ -40,6 +40,23 @@ def _find_spec(plan: dict, plan_path: Path) -> str | None:
     return str(found[0]) if found else None
 
 
+def episode_log_hook(clip: str, platform: str, post: dict) -> str | None:
+    """Hook text for a full-episode post, or None for a regular clip.
+
+    publish-log looks the hook up in clips.json. A full episode is not in
+    that file, so the uploader passes the plan title instead of letting the
+    log call fail after the upload has already succeeded.
+    """
+    cid = clip or ""
+    if cid != "episode" and not cid.endswith("_episode"):
+        return None
+    if platform == "spotify":
+        return post.get("spotify_title") or post.get("youtube") or "full episode"
+    if platform == "youtube":
+        return post.get("youtube") or post.get("spotify_title") or "full episode"
+    return post.get("youtube") or post.get("spotify_title") or "full episode"
+
+
 def log(plan_path, clip: str, platform: str, url: str | None) -> dict:
     """Log one posted clip. Returns a small dict to merge into the caller's
     output. Never raises."""
@@ -62,6 +79,9 @@ def log(plan_path, clip: str, platform: str, url: str | None) -> dict:
             cmd += ["--spec", spec]
         if speaker:
             cmd += ["--speaker", speaker]
+        hook = episode_log_hook(clip, platform, post)
+        if hook:
+            cmd += ["--hook", hook]
 
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
