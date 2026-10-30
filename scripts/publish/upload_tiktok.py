@@ -11,7 +11,9 @@ disagrees. `--submit` is refused unless the video upload has finished, every
 planned hashtag committed, and the caption body is in the editor. The footer
 Schedule button is found by its visible text when the content check has not
 exposed the accessible name "Schedule". After scheduling, the content list
-must show the expected date.
+must show the expected date. A handle glued to a Hebrew letter ("ו@handle")
+is refused before the browser opens, in `--dry` and `--submit`; write
+"ו-@handle" so TikTok can link it.
 
 Chrome's `--disable-quic` flag is on unless `SOFIT_TT_NOQUIC=0`. It is a
 modest help for "Couldn't upload" failures (about 31% to 42% success per
@@ -65,6 +67,12 @@ _EN_MONTH_ABBR = (
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 )
 _MENTION = re.compile(r"(?<![\w.@])@([A-Za-z0-9_.]{2,24}[A-Za-z0-9_])")
+# A Hebrew letter glued to a handle ("ו@tortsuk", "ל@tortsuk") hides it from
+# _MENTION, whose lookbehind rejects any word character. The handle then goes
+# out as plain text and nobody is tagged (WS216 clip-12, 2026-10-29). Hebrew
+# letters never precede the @ of an email address.
+_GLUED_MENTION = re.compile(
+    r"(?<=[\u05d0-\u05ea])@([A-Za-z0-9_.]{2,24}[A-Za-z0-9_])")
 _BIDI = re.compile("[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
 # Exact visible label of the footer submit button. Anchored so a longer
 # label (the schedule radio's container, a tour step) does not match.
@@ -93,6 +101,32 @@ def split_mentions(body: str) -> list[tuple[str, str]]:
     if pos < len(body):
         out.append(("text", body[pos:]))
     return out
+
+
+def glued_mentions(body: str) -> list[str]:
+    """Handles written straight after a Hebrew letter.
+
+    split_mentions skips them, so the caption has to be fixed (write
+    "ו-@handle") before upload.
+    """
+    return [match.group(1) for match in _GLUED_MENTION.finditer(body)]
+
+
+def glued_mention_refusal(body: str) -> dict | None:
+    """Payload when a Hebrew letter is stuck to an @handle, else None.
+
+    Checked on the caption body before the browser opens. The same refusal
+    applies to --dry and --submit.
+    """
+    handles = glued_mentions(body)
+    if not handles:
+        return None
+    return {
+        "status": "refused_glued_mention",
+        "handles": handles,
+        "hint": "a Hebrew letter is stuck to the @; write "
+                "it with a hyphen, e.g. ו-@handle",
+    }
 
 
 def ordinal_day(day: int) -> str:
@@ -254,6 +288,12 @@ def main() -> int:
     if not post:
         print(f"error: {args.clip} not in plan", file=sys.stderr)
         return 1
+    # Before the browser, and before --dry / --submit diverge. Exit 8: 7 is
+    # already the in-browser mention and submit refusal.
+    refusal = glued_mention_refusal(split_tags(post["tiktok"])[0])
+    if refusal:
+        print(json.dumps({**refusal, "clip": args.clip}, ensure_ascii=False))
+        return 8
     video = CLIPS_DIR / f"{plan['episode']}_{args.clip}.mp4"
     if not video.exists():
         print(f"error: {video} not found", file=sys.stderr)
