@@ -43,6 +43,17 @@ def _ab_tags(name: str) -> list[str]:
     return re.findall(r"\.ab-([a-z0-9]+(?:-[a-z0-9]+)*)", Path(name).name.lower())
 
 
+def is_full_episode_clip(clip_id: str) -> bool:
+    """A full-episode upload is not a row in clips.json.
+
+    `publish-log episode` (and `WS214_episode.mp4`) used to exit 1 with
+    "hook text not found", so YouTube and Spotify autolog reported failure
+    after the episode had already been scheduled.
+    """
+    cid = clip_id or ""
+    return cid == "episode" or cid.endswith("_episode")
+
+
 def _clip_and_variant(name: str) -> tuple[str, int]:
     """`clip-5` -> (clip-5, 0); `clip-5.hook2.mp4` -> (clip-5, 2).
     Renamed copies keep working: `WS205_clip-5.hook1.mp4` -> (clip-5, 1)."""
@@ -201,6 +212,10 @@ def main(argv: list[str] | None = None) -> int:
         entry = _clip_near_file(clip_path, clip_id, variant) or entry
 
     hook = args.hook or (_hook_text(entry, variant) if entry else None)
+    if not hook and is_full_episode_clip(clip_id):
+        # The performance log still wants a hook string. A full episode has
+        # no clip hook; this placeholder keeps the row attributable.
+        hook = "full episode"
     if not hook:
         print("error: hook text not found - pass --spec or --hook", file=sys.stderr)
         return 1
