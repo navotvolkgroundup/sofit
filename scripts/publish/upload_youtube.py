@@ -29,7 +29,9 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-PROFILE = Path.home() / ".ws-scraper" / "profile"
+import showhome
+
+PROFILE = showhome.browser_profile()
 
 def _publish_cfg() -> dict:
     """Machine-local account config (~/.sofit/publish.json) - the code is
@@ -39,7 +41,7 @@ def _publish_cfg() -> dict:
     import json as _json
     import sys as _sys
     from pathlib import Path as _Path
-    p = _Path.home() / ".sofit" / "publish.json"
+    p = showhome.home() / "publish.json"
     try:
         return _json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):

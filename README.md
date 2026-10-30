@@ -132,6 +132,25 @@ its own priors. Each row may also carry optional `hook_type` (the opening
 label from the clip spec). Older rows without it still parse, and the
 metrics summary groups the rows that have it under `by_hook_type`.
 
+## Several shows (a network)
+
+Each show keeps its machine-local files in its own folder,
+`~/.sofit/shows/<slug>/`: `publish.json`, `brand.json`, `show.json`, `assets/`,
+`plans/`, `performance.jsonl`, `seo-playbook.md`. Pick the show per command with
+`SOFIT_SHOW=<slug>`, or set a default in `~/.sofit/default-show`. With neither,
+`~/.sofit` itself is the one show, so a single-show install needs nothing.
+
+- `show.json` is the show's identity: `{"name", "never" (spellings to avoid),
+  "hosts", "about"}`. Prompts use it to spell the name right and to describe
+  the show when generating YouTube tags.
+- `publish.json` can set `"browser_profile"`. One Chrome profile holds one login
+  per platform, so each show's social accounts need their own profile. The
+  default is `~/.ws-scraper/profile`.
+- `sofit publish-log` stamps each row with `"show"`.
+- `sofit show-migrate <slug>` moves an existing single-show `~/.sofit` into
+  `shows/<slug>/`. It leaves a symlink at each old path and tags the old
+  performance rows with the show. It is a dry run until you add `--apply`.
+
 ## How it works
 
 ```

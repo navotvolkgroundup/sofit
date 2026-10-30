@@ -3,7 +3,8 @@
 sofit is a public OSS repo. Business content NEVER goes here: account config
 (~/.sofit/publish.json), publish plans (~/.sofit/plans/), brand kit
 (~/.sofit/assets/ - licensed font), the performance log (~/.sofit/
-performance.jsonl), and review notes are all machine-local under ~/.sofit.
+performance.jsonl), and review notes are all machine-local under ~/.sofit (per show:
+~/.sofit/shows/<slug>/, chosen by SOFIT_SHOW or ~/.sofit/default-show).
 
 ## Layout
 - `src/sofit/` — library + CLI (render, generate, publog, corrections,

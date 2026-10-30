@@ -41,10 +41,12 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import showhome
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 GRAPH = "https://graph.facebook.com/v21.0"
-CFG_PATH = Path.home() / ".sofit" / "publish.json"
+CFG_PATH = showhome.home() / "publish.json"
 
 
 def _post_multipart(url: str, fields: dict, filename: str, blob: bytes) -> tuple[int, dict]:

@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
                         "posting-time A/B is unmeasurable after the fact")
     args = p.parse_args(argv)
 
-    from . import generate  # lazy: keeps --help fast
+    from . import generate, shows  # lazy: keeps --help fast
 
     clip_id, variant = _clip_and_variant(args.clip)
     clip_path = Path(args.clip)
@@ -230,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
         row[f"ab_{dim}"] = arm or "on"
     if args.speaker:
         row["speaker"] = args.speaker
+    if shows.slug():
+        row["show"] = shows.slug()  # network roll-ups join on this
     if args.time_local:
         row["time_local"] = args.time_local
     if clip_path.exists():

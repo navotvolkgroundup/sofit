@@ -21,6 +21,8 @@ import re
 import sys
 from pathlib import Path
 
+import showhome
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 try:
     from sofit.format import rtl_caption
@@ -28,7 +30,7 @@ except Exception:  # noqa: BLE001 - keep the module import-safe for CI
     def rtl_caption(t):  # type: ignore[misc]
         return t
 
-PROFILE = Path.home() / ".ws-scraper" / "profile"
+PROFILE = showhome.browser_profile()
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
 COMPOSER = "https://business.facebook.com/latest/composer"
@@ -36,7 +38,7 @@ COMPOSER = "https://business.facebook.com/latest/composer"
 
 def _cfg() -> dict:
     try:
-        return json.loads((Path.home() / ".sofit" / "publish.json").read_text("utf-8"))
+        return json.loads((showhome.home() / "publish.json").read_text("utf-8"))
     except (OSError, ValueError):
         return {}
 
