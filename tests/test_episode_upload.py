@@ -229,3 +229,47 @@ def test_autolog_passes_a_hook_for_the_full_episode():
     assert al.episode_log_hook("episode", "spotify", {"spotify_title": "כותרת"}) == "כותרת"
     assert al.episode_log_hook("episode", "youtube", {"youtube": "כותרת"}) == "כותרת"
     assert al.episode_log_hook("WS214_episode", "youtube", {}) == "full episode"
+
+
+def test_autolog_python_honors_override_then_known_layouts(monkeypatch, tmp_path):
+    """$SOFIT_PY, then the Mac checkout venv, then ~/tools/sofit-venv.
+
+    A missing override falls through. No candidate is a hard-coded username.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("SOFIT_PY", raising=False)
+    monkeypatch.setattr(al.shutil, "which", lambda _name: None)
+    mac = tmp_path / "src" / "hebrew-chapters" / ".venv" / "bin" / "python"
+    tools = tmp_path / "tools" / "sofit-venv" / "bin" / "python"
+    mac.parent.mkdir(parents=True)
+    tools.parent.mkdir(parents=True)
+    mac.write_text("mac", encoding="utf-8")
+    tools.write_text("tools", encoding="utf-8")
+
+    assert al.sofit_python() == mac
+    mac.unlink()
+    assert al.sofit_python() == tools
+    tools.unlink()
+    assert al.sofit_python() == Path(al.sys.executable)
+
+    override = tmp_path / "override" / "python"
+    override.parent.mkdir()
+    override.write_text("override", encoding="utf-8")
+    mac.write_text("mac", encoding="utf-8")
+    monkeypatch.setenv("SOFIT_PY", str(override))
+    assert al.sofit_python() == override
+    monkeypatch.setenv("SOFIT_PY", str(tmp_path / "missing"))
+    assert al.sofit_python() == mac
+    assert "/home/box" not in " ".join(str(p) for p in al.sofit_py_candidates())
+
+
+def test_youtube_selects_text_in_the_dom_not_with_a_mac_chord():
+    assert "selectNodeContents" in yt.SELECT_TEXTBOX_JS
+    assert yt.SELECT_INPUT_JS == "el => el.select()"
+    src = (_PUBLISH / "upload_youtube.py").read_text(encoding="utf-8")
+    code = "\n".join(line for line in src.splitlines()
+                     if not line.strip().startswith("#"))
+    assert "Meta+A" not in code
+    assert "Control+A" not in code
+    assert "SELECT_TEXTBOX_JS" in code
+    assert "SELECT_INPUT_JS" in code

@@ -18,10 +18,41 @@ loop exists to answer, so a post without one is reported as
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
-SOFIT_PY = Path.home() / "src" / "hebrew-chapters" / ".venv" / "bin" / "python"
+
+def sofit_py_candidates() -> list[Path]:
+    """Interpreters that can run `python -m sofit.cli`.
+
+    `$SOFIT_PY` first, when it is set. Then the historical checkout venv
+    (the Mac default). Then `~/tools/sofit-venv`, which is the box layout
+    without a hard-coded home directory. Then the python sitting next to
+    `sofit` on `PATH`, then this process. A missing override falls through.
+    """
+    cands: list[Path] = []
+    env = os.environ.get("SOFIT_PY")
+    if env:
+        cands.append(Path(env).expanduser())
+    cands.append(Path.home() / "src" / "hebrew-chapters" / ".venv" / "bin" / "python")
+    cands.append(Path.home() / "tools" / "sofit-venv" / "bin" / "python")
+    found = shutil.which("sofit")
+    if found:
+        cands.append(Path(found).resolve().parent / "python")
+    cands.append(Path(sys.executable))
+    return cands
+
+
+def sofit_python() -> Path:
+    """First existing interpreter from `sofit_py_candidates`."""
+    cands = sofit_py_candidates()
+    for cand in cands:
+        if cand.is_file():
+            return cand
+    return cands[-1]
 
 
 def _find_spec(plan: dict, plan_path: Path) -> str | None:
@@ -72,7 +103,7 @@ def log(plan_path, clip: str, platform: str, url: str | None) -> dict:
         post = next((p for p in plan.get("posts", []) if p.get("clip") == clip), {})
         speaker = post.get("speaker")
 
-        cmd = [str(SOFIT_PY), "-m", "sofit.cli", "publish-log", clip,
+        cmd = [str(sofit_python()), "-m", "sofit.cli", "publish-log", clip,
                "--episode", str(episode), "--platform", platform, "--url", url]
         spec = _find_spec(plan, plan_path)
         if spec:

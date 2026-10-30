@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 try:  # optional; captions still render (in logical order) without it
@@ -840,13 +841,38 @@ def _load_caption_font(size: int, font: str | None = None):
             f = ImageFont.truetype(path, size)
         except Exception:
             continue
-        try:  # Rubik is a variable font — Black is the default social weight
-            f.set_variation_by_name(
-                os.environ.get("SOFIT_CAPTION_WEIGHT", "Black"))
+        # Rubik is a variable font — Black is the default social weight.
+        # A static face (a brand .ttf with one weight) raises here. The
+        # default attempt is silent: system fallbacks are static too, and
+        # warning on every one of them would fire on machines that simply
+        # don't have Rubik. An explicit SOFIT_CAPTION_WEIGHT is a request
+        # that did not happen, and that one is worth saying out loud.
+        requested = os.environ.get("SOFIT_CAPTION_WEIGHT")
+        weight = requested or "Black"
+        try:
+            f.set_variation_by_name(weight)
         except Exception:
-            pass
+            if requested:
+                _warn_static_caption_weight(path, requested)
         return f
     return ImageFont.load_default()
+
+
+_warned_static_weight: set[tuple[str, str]] = set()
+
+
+def _warn_static_caption_weight(path: str, requested: str) -> None:
+    """One warning per font+weight. A static file ignores the knob."""
+    key = (path, requested)
+    if key in _warned_static_weight:
+        return
+    _warned_static_weight.add(key)
+    warnings.warn(
+        f"SOFIT_CAPTION_WEIGHT={requested!r} ignored for {path}: "
+        "this font has no variable weight axis, so the built-in weight stays",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _merge_continuations(words: list[dict]) -> list[dict]:
@@ -2241,11 +2267,21 @@ def _splice_av_filters(layout: list, crossfade: float, source_duration: float,
     Pieces too short to overlap fall back to a hard concat plus edge fades.
 
     `fps`, when set, is an `fps=` filter on every video piece. trim+setpts
-    strips the CFR tag and xfade errors without it; the value comes from
-    `constant_fps_for_xfade` (source rate, average rate for VFR, or the
-    output override). The same rate quantizes the trims and the dissolve
-    onto whole frames — see `_splice_clock`.
+    strips the CFR tag and xfade errors without it ("current rate of 1/0 is
+    invalid" on ffmpeg 7.1); the value comes from `constant_fps_for_xfade`
+    (source rate, average rate for VFR, or the output override). The same
+    rate quantizes the trims and the dissolve onto whole frames — see
+    `_splice_clock`.
+
+    A video crossfade with no usable `fps` defaults to 30, the same fallback
+    `choose_xfade_fps` uses when the source rate is unknown. Audio-only
+    splices (`with_video=False`) do not use xfade and keep the caller's times.
     """
+    # xfade needs a constant rate. Callers that know the source pass it;
+    # anyone else still has to be able to join pieces.
+    if (with_video and crossfade > 0 and len(layout) > 1
+            and not _fps_hz(fps)):
+        fps = "30"
     fps_token = fps if _fps_hz(fps) else None
     pieces, fade, _expected = _splice_clock(layout, crossfade, fps_token)
     places = 6 if fps_token else 4
