@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import languages
+from . import shows
 from .transcribe import Segment
 
 # Titling is cheap and quality-sensitive for Hebrew; tune this to taste.
@@ -164,14 +165,34 @@ def format_pool_candidate(index: int, cand: dict) -> str:
 # one-shot selector (`make_quotes`) and the skill's candidate-pool generator so the
 # two prompts can't drift on the contract — they already did once, with the pool
 # asking for 20-60s clips while the code clamped them at 45.
-# Navot, 2026-09-24: the show's name is always written in Hebrew in anything we
-# publish. Whisper transcribes it as "Weekly Sink"/"Weekly Sync", so without this
-# the Latin spelling leaks straight from the transcript into hooks and titles.
-BRAND_RULE = (
-    " Always write the show's name in Hebrew as 'וויקלי סינק' - never 'Weekly Sync', "
-    "'Weekly Sink' or any other Latin spelling, even when the transcript spells it "
-    "that way."
-)
+# Navot, 2026-09-24: the show's name is always written the way the show spells
+# it. Whisper transcribes a Hebrew name in Latin letters, so without this the
+# transcript spelling leaks straight into hooks and titles. The name and the
+# spellings to avoid come from the show's machine-local show.json.
+SHOW = shows.show_config()
+
+
+def brand_rule(show: dict) -> str:
+    """Prompt rule pinning the show's spelling; '' when show.json has no name."""
+    name = show.get("name")
+    if not name:
+        return ""
+    never = ", ".join(f"'{n}'" for n in show.get("never") or [])
+    return (f" Always write the show's name as '{name}'"
+            + (f" - never {never} or any other spelling" if never else "")
+            + ", even when the transcript spells it differently.")
+
+
+def show_blurb(show: dict) -> str:
+    """'a Hebrew tech podcast (וויקלי סינק / Weekly Sync, hosts A and B)'."""
+    about = show.get("about") or "Hebrew podcast"
+    names = " / ".join([n for n in [show.get("name")] + list(show.get("never") or []) if n])
+    hosts = show.get("hosts") or []
+    extra = ", ".join(x for x in [names, f"hosts {' and '.join(hosts)}" if hosts else ""] if x)
+    return f"a {about} ({extra})" if extra else f"a {about}"
+
+
+BRAND_RULE = brand_rule(SHOW)
 
 CLIP_RULES = (
     "Each clip MUST: (1) OPEN with a hook in its VERY FIRST sentence that stops the "
@@ -265,7 +286,7 @@ CLIP_FIELDS = (
 # ~/Documents, which silently killed scheduled scrapers. The legacy Documents
 # path is still honored when it's the only log present.
 _LEGACY_PERF_LOG = Path.home() / "Documents" / "sofit-performance.jsonl"
-_DEFAULT_PERF_LOG = Path.home() / ".sofit" / "performance.jsonl"
+_DEFAULT_PERF_LOG = shows.home() / "performance.jsonl"
 PERF_LOG = os.environ.get("SOFIT_PERF_LOG") or str(
     _LEGACY_PERF_LOG if _LEGACY_PERF_LOG.exists()
     and not _DEFAULT_PERF_LOG.exists() else _DEFAULT_PERF_LOG)
@@ -763,8 +784,7 @@ def make_youtube_tags(segments: list[Segment], shownotes: dict | None = None,
     if shownotes:
         notes = (shownotes.get("summary") or "") + "\n" + "\n".join(shownotes.get("bullets") or [])
     system = (
-        "You prepare YouTube metadata for a Hebrew tech podcast (Weekly Sync / "
-        "וויקלי סינק, hosts נבות וולק and תור צוק). Return ONLY JSON: "
+        f"You prepare YouTube metadata for {show_blurb(SHOW)}. Return ONLY JSON: "
         '{"hashtags": [str, ...], "tags": [str, ...]}.\n'
         "hashtags: 7-8 items for the DESCRIPTION. Each starts with '#'. Join a "
         "multi-word hashtag with underscores (#בינה_מלאכותית). Hebrew unless the "
@@ -917,7 +937,7 @@ def make_clips(segments: list[Segment], titler: str = "api") -> list[dict]:
 
 # --- Brand pops: entities said aloud -> a 1s logo card at the exact word. ---
 
-BRANDS_DIR = Path.home() / ".sofit" / "assets" / "brands"
+BRANDS_DIR = shows.home() / "assets" / "brands"
 
 
 def _brand_slug(term: str) -> str:

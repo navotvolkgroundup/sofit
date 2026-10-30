@@ -336,6 +336,9 @@ def main(argv: list[str] | None = None) -> int:
         return publog.main(raw[1:])
     if raw and raw[0] == "caption-check":
         return _caption_check(raw[1:])
+    if raw and raw[0] == "show-migrate":
+        from . import shows
+        return shows.cmd_migrate(raw[1:])
 
     args = _parser().parse_args(argv)
 

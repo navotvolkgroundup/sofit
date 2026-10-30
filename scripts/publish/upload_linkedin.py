@@ -30,11 +30,13 @@ import json
 import sys
 from pathlib import Path
 
-PROFILE = Path.home() / ".ws-scraper" / "profile"
+import showhome
+
+PROFILE = showhome.browser_profile()
 
 
 def _cfg() -> dict:
-    p = Path.home() / ".sofit" / "publish.json"
+    p = showhome.home() / "publish.json"
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):

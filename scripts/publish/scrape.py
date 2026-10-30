@@ -28,12 +28,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+import showhome
+
 # ~/.sofit, NOT ~/Documents: TCC blocks launchd from Documents, which crashed
 # this scraper daily (PermissionError) and silently killed the digest.
 PERF_LOG = Path(os.environ.get("SOFIT_PERF_LOG")
-                or Path.home() / ".sofit" / "performance.jsonl")
-PROFILE_DIR = Path(os.environ.get("WS_SCRAPER_PROFILE")
-                   or Path.home() / ".ws-scraper" / "profile")
+                or showhome.home() / "performance.jsonl")
+PROFILE_DIR = showhome.browser_profile()  # honors WS_SCRAPER_PROFILE
 MIN_AGE_DAYS = 3      # metrics stabilize ~3 days after posting
 FINAL_AGE_DAYS = 14   # stop refreshing after two weeks
 
@@ -118,7 +119,7 @@ def _publish_cfg() -> dict:
     import json as _json
     import sys as _sys
     from pathlib import Path as _Path
-    p = _Path.home() / ".sofit" / "publish.json"
+    p = showhome.home() / "publish.json"
     try:
         return _json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -162,7 +163,7 @@ def _sofit_bin() -> Path:
 _CFG = _publish_cfg()
 IG_PROFILE = _CFG.get("ig_profile", "")
 CLIPS_DIR = Path(_CFG.get("clips_dir", "~/Downloads")).expanduser()
-PLANS_DIR = Path(_CFG.get("plans_dir", "~/.sofit/plans")).expanduser()
+PLANS_DIR = Path(_CFG.get("plans_dir") or showhome.home() / "plans").expanduser()
 
 
 

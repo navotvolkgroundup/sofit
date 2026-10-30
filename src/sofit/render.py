@@ -35,6 +35,7 @@ try:  # optional; captions still render (in logical order) without it
 except Exception:  # pragma: no cover - depends on env
     _bidi_display = None
 
+from . import shows
 from .defiller import (
     DefillerConfig,
     coerce_word,
@@ -178,7 +179,7 @@ def _hook_card_cfg() -> tuple[float, int]:
     secs, div = 1.8, 16
     if os.environ.get("SOFIT_BRAND") != "off":
         try:
-            cfg = json.loads((Path.home() / ".sofit" / "brand.json").read_text())
+            cfg = json.loads((shows.home() / "brand.json").read_text())
             secs = float(cfg.get("hook_secs", secs))
             div = int(cfg.get("hook_div", div))
         except (OSError, ValueError, TypeError):
@@ -200,7 +201,7 @@ def _output_fps() -> str | None:
     raw = os.environ.get("SOFIT_FPS")
     if raw is None and os.environ.get("SOFIT_BRAND") != "off":
         try:  # brand-kit default, same place as zoom_out and caption_div
-            cfg = json.loads((Path.home() / ".sofit" / "brand.json").read_text())
+            cfg = json.loads((shows.home() / "brand.json").read_text())
             raw = cfg.get("fps")
         except (OSError, ValueError):
             raw = None
@@ -304,7 +305,7 @@ def _zoom_out_factor() -> float:
     raw = os.environ.get("SOFIT_ZOOM_OUT")
     if raw is None and os.environ.get("SOFIT_BRAND") != "off":
         try:  # brand-kit default, same place as caption_div
-            cfg = json.loads((Path.home() / ".sofit" / "brand.json").read_text())
+            cfg = json.loads((shows.home() / "brand.json").read_text())
             raw = cfg.get("zoom_out")
         except (OSError, ValueError):
             raw = None
@@ -1479,13 +1480,14 @@ def _burn_captions_pillow(video_path: Path, entries: list[dict], output_path: Pa
 
 
 # --- Brand kit (machine-local, never committed: fonts are licensed and the
-# repo is public). Assets auto-load from ~/.sofit/assets when present:
+# repo is public). Assets auto-load from the show folder's assets/ (shows.home(),
+# ~/.sofit when no show is set) when present:
 #   font.ttf  -> caption/hook/tag font        (override: SOFIT_FONT)
 #   frame.mov -> alpha frame over every clip  (override: SOFIT_FRAME)
 #   badge.png -> show badge under the karaoke (override: SOFIT_BADGE)
 # ~/.sofit/brand.json {"caption_div": N} sets caption size (H//N px;
 # SOFIT_CAPTION_DIV env still wins).
-_BRAND_DIR = Path.home() / ".sofit" / "assets"
+_BRAND_DIR = shows.home() / "assets"
 
 
 def _brand_asset(env: str, name: str) -> str | None:
@@ -1502,7 +1504,7 @@ def _brand_caption_div() -> str | None:
     if os.environ.get("SOFIT_BRAND") == "off":
         return None
     try:
-        cfg = json.loads((Path.home() / ".sofit" / "brand.json").read_text())
+        cfg = json.loads((shows.home() / "brand.json").read_text())
         v = cfg.get("caption_div")
         return str(int(v)) if v else None
     except (OSError, ValueError):

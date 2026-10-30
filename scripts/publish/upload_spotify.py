@@ -31,13 +31,15 @@ from pathlib import Path
 
 import seo
 
-PROFILE = Path.home() / ".ws-scraper" / "profile"
+import showhome
+
+PROFILE = showhome.browser_profile()
 DASH = "https://creators.spotify.com/pod/dashboard/episodes"
 WIZARD = "https://creators.spotify.com/pod/dashboard/episode/wizard"
 
 
 def _cfg() -> dict:
-    p = Path.home() / ".sofit" / "publish.json"
+    p = showhome.home() / "publish.json"
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):

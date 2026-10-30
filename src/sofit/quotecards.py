@@ -19,11 +19,12 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from .render import _load_caption_font, _bidi_word_order
+from . import shows
 
 W, H = 1080, 1350
 DARK = (14, 12, 18)
 ACCENT = (233, 58, 113)
-ASSETS = Path.home() / ".sofit" / "assets"
+ASSETS = shows.home() / "assets"
 
 
 def _wrap_rtl(d, text, font, max_w):

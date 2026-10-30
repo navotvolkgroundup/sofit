@@ -13,7 +13,9 @@ import re
 import time
 from pathlib import Path
 
-PLAYBOOK = Path.home() / ".sofit" / "seo-playbook.md"
+import showhome
+
+PLAYBOOK = showhome.home() / "seo-playbook.md"
 MAX_AGE_DAYS = 31
 
 # Hebrew letters/geresh/underscore count as hashtag text: #וויקלי_סינק
