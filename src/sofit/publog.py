@@ -173,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("clip", help="rendered clip file (or bare clip id like clip-5 / clip-5.hook1)")
     p.add_argument("--episode", required=True, help="episode label, e.g. WS205")
     p.add_argument("--platform", required=True,
-                   choices=["tiktok", "instagram", "youtube", "linkedin"])
+                   choices=["tiktok", "instagram", "youtube", "linkedin", "spotify"])
     p.add_argument("--url", required=True, help="the live post URL")
     p.add_argument("--spec", help="clips.json spec (default: auto-discover next to the file)")
     p.add_argument("--hook", help="hook text override (else read from the spec)")

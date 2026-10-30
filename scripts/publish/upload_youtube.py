@@ -14,6 +14,11 @@ A vertical video under 3 minutes is a Short automatically - no special flag.
 
 Plan JSON: the post's "youtube" key is the Short's title (caption surface on
 Shorts); optional "youtube_description" fills the description box.
+
+`--clip episode` is the full long-form episode ({episode}_episode.mp4): it
+also gets the 16:9 thumbnail ("thumbnail" key, default
+{episode}_episode-cover.jpg), and --submit refuses it unless seo.check passes
+and the Tags box reads back committed.
 """
 import argparse
 import json
@@ -120,6 +125,26 @@ def main() -> int:
         title = " ".join(post["youtube"].split())[:100]
         desc = post.get("youtube_description", "")
 
+        # A full episode is the search surface (Shorts aren't): it never ships
+        # without tags, hashtags and chapters. Dry shows the problems, submit
+        # refuses them.
+        long_form = args.clip == "episode"
+        if long_form:
+            import seo
+            problems = seo.check("youtube", " ".join(post["youtube"].split()),
+                                 desc, post.get("youtube_tags", ""))
+            age = seo.playbook_age_days()
+            if age is None or age > seo.MAX_AGE_DAYS:
+                print("warn: SEO playbook missing or older than a month - "
+                      "run /sofit-seo refresh first", file=sys.stderr)
+            if problems:
+                print(f"seo: {'; '.join(problems)}", file=sys.stderr)
+                if args.submit:
+                    print(json.dumps({"status": "seo_refused", "problems": problems},
+                                     ensure_ascii=False))
+                    ctx.close()
+                    return 7
+
         page.goto("https://www.youtube.com/upload", timeout=60_000)
         page.wait_for_timeout(4_000)
         if "accounts.google.com" in page.url:
@@ -143,10 +168,28 @@ def main() -> int:
             tb.nth(1).click()
             page.keyboard.insert_text(desc)
 
+        # Long-form gets the approved 16:9 episode cover (Shorts have no custom
+        # thumbnail). Best effort: the upload stands without it, but say so.
+        thumb = Path(post.get("thumbnail") or
+                     CLIPS_DIR / f"{plan['episode']}_episode-cover.jpg").expanduser()
+        if long_form and thumb.exists():
+            try:
+                page.set_input_files("ytcp-thumbnails-compact-editor-uploader "
+                                     "input[type=file], input#file-loader",
+                                     str(thumb), timeout=10_000)
+                page.wait_for_timeout(3_000)
+                print(f"thumbnail: {thumb.name}", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"warn: thumbnail not set ({str(e)[:80]}) - add it by hand",
+                      file=sys.stderr)
+        elif long_form:
+            print(f"warn: no thumbnail ({thumb} missing)", file=sys.stderr)
+
         # Tags live behind "Show more" and were never filled - the pipeline has
         # generated them since 2026-09-24 and they went nowhere (Navot,
         # 2026-09-29). Best effort: a missing tags box must not sink the upload.
         tags = post.get("youtube_tags", "")
+        tags_committed = 0
         if tags:
             try:
                 # #toggle-button matched a DIFFERENT collapsed section, so the
@@ -173,7 +216,7 @@ def main() -> int:
                 got = box.evaluate(
                     "el => el.closest('ytcp-form-input-container').innerText")
                 used = re.search(r"(\d+)\s*/\s*500", got)
-                n = int(used.group(1)) if used else 0
+                n = tags_committed = int(used.group(1)) if used else 0
                 print(f"tags: {n}/500 chars committed"
                       f"{'' if n > 100 else '  <-- EMPTY, fill them by hand'}",
                       file=sys.stderr)
@@ -222,6 +265,12 @@ def main() -> int:
                   f"'{_date_label(post['date'])} {want_time}'", file=sys.stderr)
 
         page.screenshot(path=args.shot, full_page=False)
+        # The counter, not the plan, says whether the episode has tags.
+        if long_form and args.submit and not tags_committed:
+            print(json.dumps({"status": "tags_not_committed", "screenshot": args.shot,
+                              "fix": "the Tags box read 0/500 - fill it by hand"}))
+            ctx.close()
+            return 7
         if args.dry:
             print(json.dumps({"status": "dry_ok", "screenshot": args.shot,
                               "clip": args.clip, "date": post["date"],

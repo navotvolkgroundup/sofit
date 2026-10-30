@@ -21,6 +21,9 @@
   disabled days from the adjacent month; `--trial` exits unless the Trial
   Reel toggle reads back on. LinkedIn types the time, picks the matching
   dropdown option, and checks the composer "Posting … at" line.
+  Full episodes go to YouTube (`--clip episode`, with thumbnail) and Spotify
+  for Creators (`upload_spotify.py`); `seo.py` refuses either submit without
+  tags, hashtags, or (YouTube) a 0:00 chapter line.
 
 Account/brand specifics are machine-local, never in this repo:
 `~/.sofit/publish.json` (profile, collaborators, dirs), `~/.sofit/plans/`
