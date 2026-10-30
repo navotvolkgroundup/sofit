@@ -63,6 +63,18 @@ def _date_label(iso: str) -> str:
     return datetime.strptime(iso, "%Y-%m-%d").strftime("%b %-d, %Y")
 
 
+# The upload context advertises a Mac user-agent so Studio does not serve the
+# HeadlessChrome wall. On a Linux host that makes Ctrl+A a no-op, and Meta+A
+# is not a key there, so the auto-filled filename survived and the title was
+# appended to it. Select in the DOM instead of sending a chord.
+SELECT_TEXTBOX_JS = (
+    "el => { el.focus(); const r = document.createRange();"
+    " r.selectNodeContents(el); const s = getSelection();"
+    " s.removeAllRanges(); s.addRange(r); }"
+)
+SELECT_INPUT_JS = "el => el.select()"
+
+
 # Shorts keep the labels the commit loop has always clicked. A long-form
 # episode must not click Publish: that is "public now" when the schedule
 # did not stick.
@@ -398,7 +410,7 @@ def main() -> int:
         # Title/description are contenteditables; insert_text keeps RTL intact
         # (char-typing is what scrambles Hebrew, same lesson as TikTok).
         tb.first.click()
-        page.keyboard.press("Meta+A")
+        tb.first.evaluate(SELECT_TEXTBOX_JS)
         page.keyboard.insert_text(title)
         if desc:
             tb.nth(1).click()
@@ -529,7 +541,7 @@ def main() -> int:
         tin = page.locator("#time-of-day-container input").first
         tin.click()
         page.wait_for_timeout(600)
-        page.keyboard.press("Meta+A")
+        tin.evaluate(SELECT_INPUT_JS)
         page.keyboard.insert_text(want_time)
         page.keyboard.press("Enter")
         page.wait_for_timeout(800)

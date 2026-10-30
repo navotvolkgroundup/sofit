@@ -593,7 +593,11 @@ def test_splice_filter_renders_a_shorter_clip(tmp_path):
         check=True,
     )
     layout, out_dur, xf = splice_layout([(0.0, 1.0), (2.0, 3.0)], 0.02)
+    # fps omitted on purpose: a video xfade has to pick a constant rate
+    # itself. ffmpeg 7.1 rejects the trimmed pieces otherwise
+    # ("current rate of 1/0 is invalid").
     parts, vlabel, alabel = _splice_av_filters(layout, xf, source_duration=3.0)
+    assert ";".join(parts).count("fps=30") == 2
     out = tmp_path / "out.mp4"
     _run_ffmpeg([
         "ffmpeg", "-i", str(src), "-filter_complex", ";".join(parts),
@@ -903,12 +907,31 @@ def test_splice_filter_crossfades_audio_and_video():
     layout, out_dur, xf = splice_layout([(0.0, 1.0), (1.4, 3.0)], 0.02)
     parts, vlabel, alabel = _splice_av_filters(layout, xf, source_duration=3.0)
     graph = ";".join(parts)
-    assert "atrim=start=0.0000:end=1.0000" in graph
-    assert "atrim=start=1.4000:end=3.0000" in graph
-    assert f"xfade=transition=fade:duration={xf:.4f}" in graph
-    assert f"acrossfade=d={xf:.4f}" in graph
+    # No fps argument: the video join still stamps a constant 30fps, and the
+    # 0.02s dissolve becomes one frame. Audio trims follow that clock.
+    assert graph.count("fps=30") == 2
+    assert "atrim=start=0.000000:end=1.000000" in graph
+    assert "atrim=start=1.400000:end=3.000000" in graph
+    assert "xfade=transition=fade:duration=0.033333" in graph
+    assert "acrossfade=d=0.033333" in graph
     assert vlabel == "vcat" and alabel == "acat"
     assert out_dur == pytest.approx(1.0 + 1.6 - xf, abs=1e-6)
+
+
+def test_audio_only_splice_keeps_caller_times_without_an_fps_filter():
+    """The audiogram path joins audio only. It must not invent a frame rate."""
+    from sofit.defiller import splice_layout
+    from sofit.render import _splice_av_filters
+    layout, _out, xf = splice_layout([(0.0, 1.0), (1.4, 3.0)], 0.02)
+    parts, vlabel, alabel = _splice_av_filters(
+        layout, xf, source_duration=3.0, with_video=False)
+    graph = ";".join(parts)
+    assert vlabel is None and alabel == "acat"
+    assert "fps=" not in graph
+    assert "xfade=" not in graph
+    assert "atrim=start=0.0000:end=1.0000" in graph
+    assert "atrim=start=1.4000:end=3.0000" in graph
+    assert f"acrossfade=d={xf:.4f}" in graph
 
 
 def test_render_clips_narrative_segments_render_per_span_and_concat(monkeypatch, tmp_path):
@@ -1103,16 +1126,34 @@ def test_caption_chunking_thresholds_are_configurable(monkeypatch):
     assert [w["text"] for w in entries[0]["words"]] == \
         ["Under", "the", "Guides", "&", "Onboarding"]
 
+def _variation_axes(font) -> list:
+    getter = getattr(font, "get_variation_axes", None)
+    if getter is None:
+        return []
+    try:
+        return list(getter() or [])
+    except Exception:
+        return []
+
+
 def test_caption_style_env_knobs(monkeypatch):
-    """SOFIT_CAPTION_* tune caption weight; unset means the social defaults."""
+    """SOFIT_CAPTION_* tune caption weight; unset means the social defaults.
+
+    The caller's SOFIT_FONT and SOFIT_CAPTION_* must not leak in. A static
+    brand font reports one style for every weight, so Black == Regular.
+    """
     pytest.importorskip("PIL")
     from sofit.render import _load_caption_font
+
+    for key in ("SOFIT_FONT", "SOFIT_CAPTION_WEIGHT", "SOFIT_CAPTION_DIV",
+                "SOFIT_CAPTION_OUTLINE", "SOFIT_CAPTION_ACCENT"):
+        monkeypatch.delenv(key, raising=False)
 
     # Font weight: the knob reaches the variable-font axis.
     base = _load_caption_font(48)
     monkeypatch.setenv("SOFIT_CAPTION_WEIGHT", "Regular")
     light = _load_caption_font(48)
-    if hasattr(base, "get_variation_names"):        # bundled Rubik present
+    if _variation_axes(base):
         assert base.font.style != light.font.style
 
     # Size divisor and outline are read at burn time from the environment.
@@ -1120,6 +1161,43 @@ def test_caption_style_env_knobs(monkeypatch):
     assert max(28, 1080 // int(os.environ["SOFIT_CAPTION_DIV"])) == 28
     monkeypatch.delenv("SOFIT_CAPTION_DIV")
     assert max(28, 1080 // int(os.environ.get("SOFIT_CAPTION_DIV", "22"))) == 49
+
+
+def test_static_font_ignores_caption_weight_and_warns(monkeypatch):
+    """SOFIT_CAPTION_WEIGHT on a static face does nothing, and says so."""
+    pytest.importorskip("PIL")
+    import PIL.ImageFont as image_font
+    from sofit import render
+
+    class _Static:
+        def __init__(self):
+            class _Face:
+                style = "Black"
+            self.font = _Face()
+
+        def set_variation_by_name(self, _name):
+            raise OSError("not a variable font")
+
+        def get_variation_axes(self):
+            return []
+
+    monkeypatch.setattr(image_font, "truetype", lambda *_a, **_k: _Static())
+    monkeypatch.setenv("SOFIT_FONT", __file__)  # exists, so it is the candidate
+    monkeypatch.delenv("SOFIT_CAPTION_WEIGHT", raising=False)
+    render._warned_static_weight.clear()
+
+    base = render._load_caption_font(48)
+    monkeypatch.setenv("SOFIT_CAPTION_WEIGHT", "Regular")
+    with pytest.warns(UserWarning, match="SOFIT_CAPTION_WEIGHT='Regular' ignored"):
+        light = render._load_caption_font(48)
+    assert base.font.style == light.font.style == "Black"
+
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        again = render._load_caption_font(48)
+    assert caught == []
+    assert again.font.style == "Black"
 
 def test_zoom_out_factor_and_crop(monkeypatch):
     """SOFIT_ZOOM_OUT widens the portrait crop and pads over a blurred copy."""
