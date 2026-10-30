@@ -18,6 +18,8 @@ PUB="$HC/scripts/publish"; PY=~/.ws-scraper/venv/bin/python   # playwright venv
 PLAYBOOK=~/.sofit/seo-playbook.md             # machine-local, never in the repo
 PLAN=~/.sofit/plans/publish-plan-<EP>-episode.json
 ```
+<!-- If the repo or the venv moves, update HC here. The commands below use
+     these variables; don't hardcode a /Users/navotv path into a one-liner. -->
 
 ## refresh (monthly; also run it first if `upload` finds the playbook >31 days old)
 1. **"Researching podcast SEO from the last 30 days."** Run the skill
@@ -38,14 +40,16 @@ Needs `{clips_dir}/<EP>_episode.mp4` (the full video) and the cached transcript.
 0. **Check the playbook age** (`$PLAYBOOK` mtime). If it's missing or older than
    31 days, say so and run `refresh` first.
 1. **"Generating chapters and show notes from the transcript."**
-   `"$SOFIT" "<EP video>" --format youtube --titler claude-cli` and
-   `--format spotify --shownotes`. Chapters come from Whisper timestamps,
-   never invent them.
+   `"$SOFIT" "<EP video>" --format youtube --max-chapters 10 --titler claude-cli`
+   and `"$SOFIT" "<EP video>" --format spotify --max-chapters 10 --shownotes`.
+   The CLI default is 12; this skill caps at 10 (house rule, and the upload
+   gate refuses a YouTube description with more than 10 chapter lines).
+   Chapters come from Whisper timestamps, never invent them.
 2. **"Writing the SEO metadata to this month's playbook."** Fill `$PLAN`:
    ```json
    {"episode": "WS214", "time_local": "10:00", "posts": [{"clip": "episode",
      "date": "YYYY-MM-DD", "speaker": "both",
-     "youtube": "<title ≤100>", "youtube_description": "<hook, notes, 0:00 chapters, 3-5 #hashtags>",
+     "youtube": "<title, 100 chars max, no angle brackets>", "youtube_description": "<hook, notes, 3-10 chapter lines from 0:00, 3-5 hashtags, 5000 UTF-8 bytes max>",
      "youtube_tags": "<comma list ≤500 chars: show name in Hebrew+Latin+misspellings, hosts, every named person/company, topic phrases>",
      "thumbnail": "~/Downloads/WS214_episode-cover.jpg",
      "spotify_title": "<title>", "spotify_description": "<hook, notes, chapters, 3-5 #hashtags>"}]}
@@ -61,13 +65,21 @@ Needs `{clips_dir}/<EP>_episode.mp4` (the full video) and the cached transcript.
 5. **"Dry run on YouTube / Spotify."**
    `$PY $PUB/upload_youtube.py --clip episode --plan $PLAN --dry` and
    `$PY $PUB/upload_spotify.py --plan $PLAN --dry`. Open both screenshots and
-   check them yourself: tags counter >0/500, the thumbnail is the cover, the
-   schedule date and time are right, the hashtags made it into the description.
-   Report what you saw.
+   check them yourself: the tags counter is near the planned length (not just
+   above 0), the thumbnail is the cover, each chapter is on its own line, and
+   the schedule date and time are the Asia/Jerusalem ones in the plan. A status
+   other than `dry_ok` is a refusal. Report what you saw.
 6. **"Scheduling on YouTube / Spotify."** After the yes, run the same commands
-   with `--submit`. Both refuse (exit 7) on SEO problems or 0 committed tags,
-   and refuse (exit 6) when the Spotify readback fails. Never work around a
-   refusal; fix the plan. Autolog records each post with its URL.
+   with `--submit`. A dry run whose status is not `dry_ok` is a refusal — do
+   not submit. YouTube long-form refuses (exit 7) on SEO problems or when the
+   tags counter is under ~80% of the planned tag text, and refuses (exit 6)
+   when the schedule readback fails, the thumbnail did not land, or the upload
+   and checks are not finished (it will not close the browser on a multi-GB
+   file that is still uploading). Spotify refuses (exit 7) on SEO problems and
+   (exit 6) when the readback fails, the review step would publish now, or
+   that title is already on the Episodes list. The Spotify commit clicks only
+   Next or Schedule, never Publish. Never work around a refusal; fix the plan.
+   Autolog records each post with its URL, including the full `episode` clip.
 7. **"Done."** Give both links and where to see them scheduled (YT Studio
    Content, Spotify for Creators Episodes).
 
@@ -77,5 +89,16 @@ Needs `{clips_dir}/<EP>_episode.mp4` (the full video) and the cached transcript.
 - The Spotify wizard selectors were not probed before the first login. The
   first `--dry` is the probe: if it reports `dry_readback_failed`, fix the
   selector in upload_spotify.py from the screenshot and the DOM, then rerun.
-- YouTube drops ALL hashtags if a description has more than 15. The gate
-  enforces this.
+- 15 hashtags in a description is a house rule, not a YouTube limit. YouTube
+  allows more than 60 (Help answer 6390658) and ignores only the extras past
+  that. The gate still refuses above 15, and it says so as a house rule.
+- YouTube chapters: at least 3 lines, the first at 0:00, and at most 10
+  (the 10 is a house cap). Pass `--max-chapters 10`; the CLI default is 12.
+- `<` and `>` in a YouTube title or description are refused.
+- A YouTube description is capped at 5000 UTF-8 bytes, which is stricter
+  than 5000 characters when the text is Hebrew.
+- Spotify's 200-character title cap is unverified; the gate enforces it
+  anyway and the refusal says so. Hashtags on Spotify are a house rule
+  (there is no tags field).
+- `time_local` is an Asia/Jerusalem wall clock. The Spotify uploader does
+  not convert it to UTC.
