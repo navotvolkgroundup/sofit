@@ -57,7 +57,8 @@ sofit episode.mp4 --embed-into episode.m4a   # writes episode.chapters.m4a
 
 ### Making chapters show up everywhere
 - **YouTube** — `--format youtube`, paste into the description. First chapter at
-  `0:00`, ≥3 chapters, ≥10s apart (enforced).
+  `0:00`, ≥3 chapters, ≥10s apart (enforced). The episode title and the 16:9
+  cover (thumbnail) follow [docs/youtube-packaging.md](docs/youtube-packaging.md).
 - **Spotify (and Megaphone-hosted shows)** — `--format spotify`, paste into the
   episode description. Spotify parses description timestamps into chapters; it needs
   `0:00` first, ≥3 chapters, and **≥30s apart** (enforced — stricter than YouTube).
@@ -163,7 +164,8 @@ cp -R skills/sofit* ~/.claude/skills/
 |---|---|
 | `/sofit` | full pipeline + router to the sub-skills below |
 | `/sofit-transcribe` | local faster-whisper transcription (cached, one-time) |
-| `/sofit-kit` | chapters + Hebrew show notes + pull-quotes for descriptions |
+| `/sofit-kit` | chapters + Hebrew show notes + pull-quotes; YouTube title and cover follow [docs/youtube-packaging.md](docs/youtube-packaging.md) |
+| `/sofit-seo` | monthly SEO refresh + full-episode upload; same packaging doc for the title and cover |
 | `/sofit-clips` | suggest → pick → render captioned 9:16 social clips |
 | `/sofit-captions` | fix caption typos, timing-preserving, then re-render |
 | `/sofit-trim` | cut a moment out of a finished clip |

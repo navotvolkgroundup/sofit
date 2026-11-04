@@ -1,6 +1,6 @@
 ---
 name: sofit-seo
-description: Monthly podcast + YouTube SEO refresh (two /last30days runs distilled into ~/.sofit/seo-playbook.md) and the full-episode upload to YouTube and Spotify for Creators with that playbook's titles, descriptions, chapters, tags and hashtags. Use when the user says "sofit-seo", "refresh the SEO playbook", "upload the episode to YouTube/Spotify", or a monthly SEO run fires. Part of the sofit tool (see /sofit for the full pipeline).
+description: Monthly podcast + YouTube SEO refresh (two /last30days runs distilled into ~/.sofit/seo-playbook.md) and the full-episode upload to YouTube and Spotify for Creators with that playbook's titles, descriptions, chapters, tags and hashtags. Use when the user says "sofit-seo", "refresh the SEO playbook", "upload the episode to YouTube/Spotify", "write the YouTube title", "make the episode cover", or a monthly SEO run fires. Titles and 16:9 covers follow docs/youtube-packaging.md. Part of the sofit tool (see /sofit for the full pipeline).
 ---
 
 # sofit-seo
@@ -32,7 +32,10 @@ PLAN=~/.sofit/plans/publish-plan-<EP>-episode.json
    goes, description first 150 chars, chapters, how many tags and which kinds,
    3-5 hashtags, thumbnail text) and for Spotify (title, first description
    lines, hashtags, episode number). Drop anything the research only hints
-   at. At the top, list **what changed vs last month**.
+   at. Title pattern and thumbnail text stay inside
+   [`docs/youtube-packaging.md`](../../docs/youtube-packaging.md) (one visual
+   system, at most one thumbnail test). The playbook can add a checkable
+   detail; it does not replace that file. At the top, list **what changed vs last month**.
 4. **"Done - here's what changed."** Show the user the diff summary.
 
 ## upload <EP> (each full episode)
@@ -45,7 +48,9 @@ Needs `{clips_dir}/<EP>_episode.mp4` (the full video) and the cached transcript.
    The CLI default is 12; this skill caps at 10 (house rule, and the upload
    gate refuses a YouTube description with more than 10 chapter lines).
    Chapters come from Whisper timestamps, never invent them.
-2. **"Writing the SEO metadata to this month's playbook."** Fill `$PLAN`:
+2. **"Writing the SEO metadata to this month's playbook."** Read
+   `$HC/docs/youtube-packaging.md` and apply it to the `youtube` title and
+   the 16:9 cover at `thumbnail` before filling the plan. Then fill `$PLAN`:
    ```json
    {"episode": "WS214", "time_local": "10:00", "posts": [{"clip": "episode",
      "date": "YYYY-MM-DD", "speaker": "both",
@@ -61,7 +66,10 @@ Needs `{clips_dir}/<EP>_episode.mp4` (the full video) and the cached transcript.
 3. **"Checking the SEO gate."** `cd $PUB && $PY -c "import seo,json; p=json.load(open('$PLAN'))['posts'][0]; print(seo.check('youtube', p['youtube'], p['youtube_description'], p['youtube_tags']), seo.check('spotify', p['spotify_title'], p['spotify_description']))"`.
    Fix every problem. **No tags or no hashtags means no upload.**
 4. **Approval gate.** Show Navot the title, description, tags and the
-   thumbnail for both platforms. Wait for a yes.
+   thumbnail for both platforms. The cover still matches
+   `docs/youtube-packaging.md` (Hebrew text, HD badge only, no frame, a
+   natural host frame, same system as the last covers, title frames that
+   promise). Wait for a yes.
 5. **"Dry run on YouTube / Spotify."**
    `$PY $PUB/upload_youtube.py --clip episode --plan $PLAN --dry` and
    `$PY $PUB/upload_spotify.py --plan $PLAN --dry`. Open both screenshots and

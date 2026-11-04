@@ -19,6 +19,7 @@ performance.jsonl), and review notes are all machine-local under ~/.sofit.
   fresh page loads before declaring done (stale DOM lies).
 - Approval gates are standing policy: covers, carousels, clips and publishes
   are shown to Navot before they ship. --dry first, always.
+- YouTube episode titles and 16:9 covers follow `docs/youtube-packaging.md`.
 - Every posted clip gets publish-log with --speaker. Never post without logging.
 - After any correction: update tasks/lessons.md (gitignored, machine-local).
 - Run tests (.venv/bin/python -m pytest) before committing; the suite must

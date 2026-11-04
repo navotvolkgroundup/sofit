@@ -23,7 +23,8 @@
   dropdown option, and checks the composer "Posting … at" line.
   Full episodes go to YouTube (`--clip episode`, with thumbnail) and Spotify
   for Creators (`upload_spotify.py`); `seo.py` refuses either submit without
-  tags, hashtags, or (YouTube) a 0:00 chapter line.
+  tags, hashtags, or (YouTube) a 0:00 chapter line. The YouTube title and
+  thumbnail follow `docs/youtube-packaging.md`.
 
 Account/brand specifics are machine-local, never in this repo:
 `~/.sofit/publish.json` (profile, collaborators, dirs), `~/.sofit/plans/`

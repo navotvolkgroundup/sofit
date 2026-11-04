@@ -1,6 +1,6 @@
 ---
 name: sofit
-description: Turn a Hebrew podcast episode (Weekly Sync) into chapters, show notes, pull-quotes, and captioned vertical (9:16) social clips — then fix caption typos conversationally, add the show logo, and cut segments. Use when the user wants to process a Hebrew podcast / Weekly Sync episode, make social clips, generate chapters or show notes, fix a caption, add a logo/watermark to clips, or trim a moment out of a clip. Works from ANY directory by pointing at the sofit repo.
+description: Turn a Hebrew podcast episode (Weekly Sync) into chapters, show notes, pull-quotes, and captioned vertical (9:16) social clips — then fix caption typos conversationally, add the show logo, and cut segments. Use when the user wants to process a Hebrew podcast / Weekly Sync episode, make social clips, generate chapters or show notes, write the YouTube episode title or 16:9 cover, fix a caption, add a logo/watermark to clips, or trim a moment out of a clip. YouTube titles and covers follow docs/youtube-packaging.md. Works from ANY directory by pointing at the sofit repo.
 ---
 
 # sofit (portable entry point)
@@ -17,6 +17,7 @@ this skill end-to-end. All share the same Home/env block below.
 |---|---|---|
 | Transcribe | `/sofit-transcribe` | local faster-whisper transcription (cached, one-time) |
 | Text kit | `/sofit-kit` | chapters + Hebrew show notes + pull-quotes for descriptions |
+| YouTube title + cover | `/sofit-seo` | episode title and 16:9 cover per `docs/youtube-packaging.md`, then upload |
 | Social clips | `/sofit-clips` | suggest → pick → render captioned 9:16 clips (face crop + logo) |
 | Fix captions | `/sofit-captions` | correct caption typos, timing-preserving, re-render |
 | Trim a clip | `/sofit-trim` | cut a moment out of a finished mp4 |
@@ -70,6 +71,9 @@ Fast (cached transcript). Paste chapters into the episode description.
 "$SOFIT" "<episode.mp4>" --format spotify --shownotes --quotes --titler claude-cli   # Spotify/Megaphone
 "$SOFIT" "<episode.mp4>" --format youtube --titler claude-cli                          # YouTube
 ```
+The YouTube **episode title** and the **16:9 cover** are not this kit's output.
+When you write either, follow `docs/youtube-packaging.md` (`$HC/docs/youtube-packaging.md`).
+`/sofit-seo` applies the same file before upload. Show the cover before it ships.
 
 ### 2.5 Trend playbook — staleness check before cutting clips
 Short-form technique moves slowly, so this is a check, not a ritual. If
