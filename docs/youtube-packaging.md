@@ -16,21 +16,21 @@ One strong standalone clip, posted rarely, can lift the rest of the catalog. A c
 
 ## One visual system
 
-The same system on every cover, so a viewer recognizes the show and clicks before reading the title:
+The same system on every cover, so a viewer recognizes the show and clicks before reading the title. That system is the [Cover template](#cover-template) below. A variation changes the face, the two words, and the episode number. Layout, type, and color stay put.
 
-- color grade, framing, and face size
-- font, where the text sits, how many words, text size, and what is italic
-- title format, title length, and how a guest name is written
+Study outliers in a swipe file. A variation stays inside this template. Another channel's style, copied because it got views, breaks the row of covers.
 
-Study outliers in a swipe file. A variation stays inside this system. Another channel's style, copied because it got views, breaks the row of covers.
+Match the weight of the conversation. Most YouTube thumbnails shout (urgent, gadget, this week only). This show is a longer conversation. A serious face and two words beat a loud layout.
 
-These are already the system. Keep them:
+## Cover template
 
-- Cover text is Hebrew.
-- The only mark is the HD Weekly Sync badge. No frame and no border.
-- Use a natural, flattering frame of the host who carries the episode. A Tor-only cover is fine.
+Direction B, "big face, two words", is the fixed Weekly Sync YouTube cover. Navot picked it. Every episode uses it.
 
-Match the weight of the conversation. Most YouTube thumbnails shout (urgent, gadget, this week only). This show is a longer conversation. A serious face and a few words beat a loud layout. The cover should look as considered as the episode.
+- **Canvas.** 1280×720, JPG, under 2MB. YouTube rejects a larger thumbnail, and the uploader refuses it. The face and the two words have to stay readable when the cover is a phone thumbnail.
+- **Face.** One large host face. Tor is the default. Use a natural, flattering full-resolution frame from the episode, and use that frame directly. A still that was already cropped does not get cropped again. The face fades into a navy field on one side. The fade sits beside the face: it does not cut the head, cover the eyes, or dissolve the face.
+- **Words.** At most two Hebrew words, set huge, in Simpler Black, white. Those two words are the cover promise. The longer YouTube title is the line in [Titles](#titles) below.
+- **Marks.** A thin pink strip along the bottom, the Weekly Sync badge, and a small pink `פרק N` tag with this episode's number. No frame and no border around the cover.
+- **Files.** Simpler Black and the badge live in the machine-local brand kit (`~/.sofit/assets/`). Leave the font and the art there. They do not go in this repo.
 
 ## Titles
 
@@ -49,4 +49,4 @@ How I Write could run 15–20 thumbnails and up to eight A/B tests because the c
 - Run at most one thumbnail test at a time.
 - Choose from the template plus what the clip log already showed, and let a test confirm one open question.
 - The next test waits until this one has a result or has been called off.
-- Every option in that test still uses the visual system above.
+- Every option in that test still uses the Cover template above. Swap the two words or the frame. Leave the layout alone.

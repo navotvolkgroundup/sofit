@@ -66,10 +66,9 @@ Needs `{clips_dir}/<EP>_episode.mp4` (the full video) and the cached transcript.
 3. **"Checking the SEO gate."** `cd $PUB && $PY -c "import seo,json; p=json.load(open('$PLAN'))['posts'][0]; print(seo.check('youtube', p['youtube'], p['youtube_description'], p['youtube_tags']), seo.check('spotify', p['spotify_title'], p['spotify_description']))"`.
    Fix every problem. **No tags or no hashtags means no upload.**
 4. **Approval gate.** Show Navot the title, description, tags and the
-   thumbnail for both platforms. The cover still matches
-   `docs/youtube-packaging.md` (Hebrew text, HD badge only, no frame, a
-   natural host frame, same system as the last covers, title frames that
-   promise). Wait for a yes.
+   thumbnail for both platforms. The cover is Cover template B in
+   `docs/youtube-packaging.md` (big face, two words, navy fade, pink strip,
+   badge, `פרק N`). Wait for a yes.
 5. **"Dry run on YouTube / Spotify."**
    `$PY $PUB/upload_youtube.py --clip episode --plan $PLAN --dry` and
    `$PY $PUB/upload_spotify.py --plan $PLAN --dry`. Open both screenshots and
